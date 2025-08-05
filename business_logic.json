@@ -1,0 +1,44 @@
+[
+    {
+        "id": 1754302310,
+        "user_id": "test_user_456",
+        "original_query": "test query",
+        "feedback_text": "This is test feedback",
+        "context": {
+            "test": "context"
+        },
+        "status": "approved",
+        "created_at": 1754302310.4254727
+    },
+    {
+        "id": 1754380569,
+        "user_id": "test_user_456",
+        "original_query": "test query",
+        "feedback_text": "This is test feedback",
+        "context": {
+            "test": "context"
+        },
+        "status": "approved",
+        "created_at": 1754380569.792018
+    },
+    {
+        "id": 1754381317,
+        "user_id": "test_user_456",
+        "original_query": "test query",
+        "feedback_text": "This is test feedback",
+        "context": {
+            "test": "context"
+        },
+        "status": "approved",
+        "created_at": 1754381317.7273936
+    },
+    {
+        "id": 1754382000,
+        "user_id": "U06A1RBU5TP",
+        "original_query": "payment status should be 300 in case someone asks online bookings",
+        "feedback_text": "For online bookings queries, always filter by paymentstatus = 300",
+        "context": {},
+        "status": "approved",
+        "created_at": 1754382000.0
+    }
+]
