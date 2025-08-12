@@ -5,8 +5,6 @@ import os
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path=dotenv_path)
-else:
-    print("⚠️ .env file not found, please ensure it exists in the project root.")
 
 import time
 import pandas as pd
@@ -17,7 +15,8 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 import google.generativeai as genai
 from datetime import datetime
 import re
-from rapidfuzz import process as fuzzy_process, fuzz
+import requests
+from rapidfuzz import fuzz, process
 
 # Import configurations
 from config import *
@@ -42,91 +41,43 @@ from database import SimpleDatabase
 db_manager = SimpleDatabase(os.getenv("PRESTO_CONNECTION"))
 from subscription_manager import subscription_manager
 from business_logic_manager import business_logic_manager
-from intent_classifier import intent_classifier
-
 from masking_service import masking_service
+from nlp_extractor import nlp_extractor
+from sql_builder import build_sql
+from distinct_cache import distinct_cache
 
-# Simple caching for user contexts and pending clarifications
-user_contexts = {}
-pending_clarifications = {}
+# Simple in-memory session store for per-user mode
+USER_SESSIONS = {}
+
+# Lightweight debug logger
+def debug(message: str):
+    try:
+        ts = datetime.now().strftime('%H:%M:%S')
+        print(f"[DEBUG {ts}] {message}")
+    except Exception:
+        print(f"DEBUG: {message}")
 
 class SimplifiedBot:
     def __init__(self, db_manager):
         self.model = model
         self.db = db_manager
         
-    def resolve_products(self, text):
-        """
-        Intelligently resolves MULTIPLE products from text.
-        It scans the text for all known aliases and returns a list of all product IDs found.
-        """
-        print(f"DEBUG: Resolving all products for text: '{text}'")
-        text_lower = text.lower()
-        
-        # A more comprehensive list of stop words
-        stop_words = ['for', 'a', 'an', 'the', 'is', 'are', 'was', 'were', 'tell', 'me', 'what', 'how', 'many', 'much', 'in', 'of', 'on', 'at', 'by', 'show', 'leads', 'bookings', 'revenue', 'premium', 'conversion', 'rate', 'today', 'yesterday', 'this', 'last', 'week', 'month', 'year', 'insurance', 'policy', 'comp', 'about', 'and', 'also', 'number', 'count']
-        
-        # Marketing channels that should NOT be treated as products
-        marketing_channels = ['seo', 'crm', 'direct', 'referral', 'brand', 'paid', 'fos', 'mobile', 'app', 'marketing', 'campaigns', 'channel', 'system', 'team', 'from', 'came', 'through', 'via', 'using', 'with', 'by', 'get', 'gets', 'getting']
-        
-        words = [word for word in re.findall(r'\b\w+\b', text_lower) if word not in stop_words and word not in marketing_channels]
-        
-        found_products = set()
-        
-        
-        # First, check for exact phrases (most specific matches)
-        exact_phrases = ['fire insurance', 'marine insurance', 'workmen compensation', 'group health insurance']
-        exact_match_found = False
-        for phrase in exact_phrases:
-            if phrase in text_lower:
-                if phrase in PRODUCTS:
-                    found_products.add(PRODUCTS[phrase])
-                    exact_match_found = True
-                    break  # Found exact match, don't look for more general ones
-        
-        # If no exact phrase found, do the general alias matching
-        if not exact_match_found:
-            # Sort aliases by length, longest first, to prioritize more specific matches
-            sorted_aliases = sorted(PRODUCTS.keys(), key=len, reverse=True)
-            
-            # Do a simple substring check for direct alias matches
-            for alias in sorted_aliases:
-                # Use word boundaries to avoid matching parts of other words (e.g., 'fire' in 'firewall')
-                if re.search(r'\b' + re.escape(alias) + r'\b', text_lower):
-                    found_products.add(PRODUCTS[alias])
-
-
-        # Then, use fuzzy matching on the remaining words to catch typos/variations (only if no exact match)
-        if not exact_match_found and words:
-            search_phrase = " ".join(words)
-            matches = fuzzy_process.extract(search_phrase, PRODUCTS.keys(), scorer=fuzz.token_set_ratio, score_cutoff=75)
-            for match, score, _ in matches:
-                found_products.add(PRODUCTS[match])
-
-        if not found_products:
-            print("DEBUG: No products found.")
-            return []
-            
-        product_id_list = sorted(list(found_products))
-        print(f"DEBUG: All products found: {product_id_list}")
-        return product_id_list
+    def process_query_with_ai(self, text):
+        # Two-stage: extract entities only
+        entities = nlp_extractor.extract(text)
+        return entities
 
     def generate_response(self, user_text, user_id, product_ids=None):
         """Single AI call to handle all user requests with a more robust prompt."""
         
+        # Entities provided from process_query_with_ai
+        entities = product_ids if isinstance(product_ids, dict) else {}
+        products = entities.get("products", []) if entities else []
         product_context = "No specific product filter has been identified."
-        if product_ids:
-            names = []
-            for pid in product_ids:
-                best_name = "Unknown"
-                for alias, p_id in PRODUCTS.items():
-                    if p_id == pid:
-                        if len(alias) > len(best_name) or best_name == "Unknown":
-                            best_name = alias
-                names.append(best_name.title())
-            
+        if products:
+            names = [name for name, pid in PRODUCTS.items() if pid in products]
             product_names_str = ", ".join(sorted(list(set(names))))
-            product_context = f"**Product Filter**: The user is asking about **{product_names_str}**. You MUST use these exact IDs in your query: `{product_ids}`."
+            product_context = f"**Product Filter**: The user is asking about **{product_names_str}**. You MUST use these exact IDs in your query: `{products}`."
 
         approved_logic = business_logic_manager.get_relevant_approved_logic(user_text)
         logic_context = ""
@@ -134,90 +85,360 @@ class SimplifiedBot:
             logic_context = "\n\n**CRITICAL INSTRUCTIONS FROM HUMAN EXPERTS:**\n" + "\n".join(f"- {logic}" for logic in approved_logic)
             
         time_syntax_examples = "\n".join([f"- For '{name}', use this SQL: `{syntax}`" for name, syntax in TIME_PATTERNS.items()])
+        current_year = datetime.now().year
+        time_syntax_examples += f"\n- For 'april month' or 'april', use: `leadmonth = 'April-{current_year}'`"
+
+        column_details = "\n".join([f"- `{col}` ({meta.get('data_type', 'unknown')}): {meta.get('description', '')}" for col, meta in TABLE_SCHEMA.items()])
+        # Merge static samples with dynamic distincts
+        distincts = distinct_cache.get()
+        categorical_values_context = self.get_categorical_values_context(distincts)
+
+        prompt = f"""You are ThinkTank, a specialized AI analyst. Your task is to generate a single, precise JSON object to answer the user's query.
+
+        **User Query**: "{user_text}"
+        {product_context}
+
+        **CRITICAL DATABASE RULES**:
+        -   **ONLY use this table**: `sme_analytics.sme_leadbookingrevenue`
+        -   **DATE FORMAT**: The `leadmonth` column is a string like 'April-2024'.
+        -   **Available columns**: {column_details}
+        {categorical_values_context}
+        {logic_context}
+
+        **Your Task**: Respond with a JSON object for ONE of the following intents.
+        1.  **"metric_query"**: For any request about business data.
+            -   The SQL query must be valid Presto SQL and NEVER end with a semicolon.
+            -   Example: `{{"intent": "metric_query", "sql": "SELECT COUNT(*) FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (5)", "explanation": "This query counts leads for Fire product."}}`
+        2.  **"feedback"**: If the user provides feedback (e.g., "this is wrong," "good job").
+            -   Example: `{{"intent": "feedback", "message": "User provided feedback."}}`
+        3.  **"conversation"**: For greetings or simple chat.
+            -   Example: `{{"intent": "conversation", "response": "Hello! How can I help?"}}`
+
+        **Time Syntax**:
+        {time_syntax_examples}
         
-        # Dynamically build the column details from the enhanced TABLE_SCHEMA
-        column_details = []
-        for col, meta in TABLE_SCHEMA.items():
-            details = f"- `{col}` ({meta.get('data_type', 'unknown')}): {meta.get('description', '')}"
-            if meta.get('pii_level', 'none') != 'none':
-                details += f" PII: {meta['pii_level']}, Strategy: {meta['masking_strategy']}."
-            column_details.append(details)
-        available_columns_context = "\n".join(column_details)
-
-        # Get categorical values context
-        categorical_values_context = self.get_categorical_values_context()
-
-        prompt = f"""You are ThinkTank, a specialized AI analyst. Your task is to respond to user queries about insurance data by generating a single, precise JSON object.
-
-**User Query**: "{user_text}"
-
-**Contextual Analysis**:
-{product_context}
-
-**CRITICAL DATABASE RULES**:
-- **ONLY use this table**: `sme_analytics.sme_leadbookingrevenue`
-- **NEVER invent or use other table names** like ghi_bookings, fire_bookings, product_lookup, etc.
-- **NEVER use JOIN statements** - only use the single table mentioned above
-- **For date comparisons**: Always cast date columns using `CAST(column_name AS DATE)` or `DATE(column_name)` before comparison
-- **Available columns**: 
-{available_columns_context}
-- **For product names**: Use CASE statements to map investmenttypeid to product names, like: `CASE WHEN investmenttypeid = 5 THEN 'Fire Insurance' WHEN investmenttypeid = 13 THEN 'Marine Insurance' END`
-{categorical_values_context}
-
-**Your Task**: Respond with a JSON object for ONE of the following intents.
-
-1.  **"metric_query"**: For any request about business data.
-    - **CRITICAL**: If the Contextual Analysis provides `Product Filter` IDs, you MUST use those exact IDs in a `WHERE investmenttypeid IN (...)` clause.
-    - **CRITICAL**: You MUST use the correct SQL time syntax provided in the examples below. Do NOT use functions like `DATE('yesterday')`.
-    - **CRITICAL**: The SQL query must be valid Presto SQL and NEVER end with a semicolon `;`.
-    - **For categorization requests** (like "agent wise", "product wise"): Use `GROUP BY` with the appropriate column (e.g., `GROUP BY leadassignedagentname` for agent-wise, `GROUP BY investmenttypeid` for product-wise).
-    - **For product-wise results**: Use CASE statements to show product names instead of IDs in the SELECT clause. **CRITICAL**: When using CASE statements with GROUP BY, you MUST repeat the full CASE expression in GROUP BY, not use the alias.
-    - **For categorical value filters**: If the user mentions specific values (like "SEO", "Google Ads", "Direct", etc.), check the Available Categorical Values above and add appropriate WHERE clauses (e.g., `WHERE mkt_category = 'SEO'`).
-    - **IMPORTANT**: For marketing channels like "SEO", "CRM", "Direct", "Referral", "Brand Paid", "Non Brand Paid", "FOS" - use `mkt_category` column. For system/platform sources, use `leadcreationsource` column.
-    - **CRITICAL**: "CRM" in user queries refers to the marketing category, so always use `mkt_category = 'CRM'`, not `leadcreationsource = 'CRM'`.
-    - **For online bookings**: When users ask about "online bookings", always add `AND paymentstatus = 300` to filter for completed online payments.
-    - **For date ranges**: Use proper date casting and the correct time patterns provided below.
-    - Provide a simple `explanation` of what the query does.
-    - Example: `{{"intent": "metric_query", "sql": "SELECT CASE WHEN investmenttypeid = 5 THEN 'Fire Insurance' WHEN investmenttypeid = 13 THEN 'Marine Insurance' END as product_name, COUNT(*) FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (5, 13) GROUP BY CASE WHEN investmenttypeid = 5 THEN 'Fire Insurance' WHEN investmenttypeid = 13 THEN 'Marine Insurance' END", "explanation": "This query counts leads for Fire and Marine products, grouped by product."}}`
-    - Example with marketing filter: `{{"intent": "metric_query", "sql": "SELECT COUNT(*) FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (1) AND mkt_category = 'CRM' AND CAST(leaddate AS DATE) >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3' MONTH", "explanation": "This query counts leads for Group Health Insurance from CRM source in the last 3 months."}}`
-
-2.  **"conversation"**: For simple greetings, chit-chat, or if the user asks for multiple, distinct things in a single query.
-    - Example for complex query: `{{"intent": "conversation", "response": "I can only handle one request at a time. Please ask about GHI leads or Fire bookings separately."}}`
-    - Example for greeting: `{{"intent": "conversation", "response": "Hello! How can I help you with your business metrics today?"}}`
-
-3.  **"feedback"**: If the user provides feedback, suggestions, or asks for improvements (e.g., "this is wrong," "good job", "show product names instead of IDs", "when someone says product wise", "payment status should be 300", "always filter by", "should include", "must have").
-    - Example: `{{"intent": "feedback", "message": "The user wants to see product names instead of investmenttypeid in results."}}`
-    - Example: `{{"intent": "feedback", "message": "User provided business rule: payment status should be 300 for online bookings."}}`
-
-**Reference: Correct SQL Time Syntax**:
-{time_syntax_examples}
-{logic_context}
-
-Respond now with only the JSON object."""
-
-        print("DEBUG: ----- GENERATING AI PROMPT -----")
+        Respond now with only the JSON object."""
+        
+        # Deterministic SQL building
+        sql_payload = build_sql(entities or {})
+        if sql_payload.get("intent") != "metric_query":
+            # Non-metric intents fallback to conversation/feedback
+            if sql_payload.get("intent") == "feedback":
+                return {"intent": "feedback", "message": "Thanks for the feedback."}
+            return {"intent": "conversation", "response": "Could you clarify what you need?"}
+        return sql_payload
+    
+    def resolve_agent_lead_id(self, agent_name: str, products=None):
+        """Find a representative lead_agentid for the given agent name, optionally within product IDs."""
+        if not agent_name:
+            return None
         try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config={"max_output_tokens": MAX_OUTPUT_TOKENS, "temperature": TEMPERATURE}
-            )
-            response_text = response.text.strip().replace('```json', '').replace('```', '')
-            print(f"DEBUG: ----- RAW AI RESPONSE -----\n{response_text}\nDEBUG: ---------------------------")
-            
-            ai_obj = json.loads(response_text)
+            name_safe = str(agent_name).replace("'", "''").strip().lower()
+            # Build OR predicate across multiple possible agent name columns
+            name_columns = [
+                'leadassignedagentname', 'currentlyassigneduser', 'leadreportingmanagername',
+                'leadreportingmanagername2', 'first_assigned_agent', 'booking_agent',
+                'booking_agent_manager', 'booking_agent_manager2'
+            ]
+            like_clauses = [
+                f"LOWER(CAST({col} AS VARCHAR)) LIKE CONCAT('%%', '{name_safe}', '%%')" for col in name_columns
+            ]
+            name_predicate = "( " + " OR ".join(like_clauses) + " )"
 
-            if "metric_query" in ai_obj and "intent" not in ai_obj:
-                inner = ai_obj["metric_query"]
-                ai_obj = {
-                    "intent":      "metric_query",
-                    "sql":         inner.get("query") or inner.get("sql"),
-                    "explanation": inner.get("explanation", "Query generated based on your request.")
-                }
-            
-            return ai_obj
+            where_parts = [
+                "lead_agentid IS NOT NULL",
+                "lead_agentid <> ''",
+                name_predicate,
+            ]
+            if products:
+                ids_csv = ", ".join(str(p) for p in products)
+                where_parts.append(f"investmenttypeid IN ({ids_csv})")
+            where_sql = " AND ".join(where_parts)
+            sql = (
+                "SELECT lead_agentid "
+                "FROM sme_analytics.sme_leadbookingrevenue "
+                f"WHERE {where_sql} "
+                "ORDER BY COALESCE(bookingdate, leaddate) DESC "
+                "LIMIT 1"
+            )
+            df = self.db.run_query(sql, use_cache=True)
+            if not df.empty:
+                return str(df.iloc[0, 0])
+
+            # Retry without product filter if none found
+            if products:
+                where_sql = " AND ".join([
+                    "lead_agentid IS NOT NULL",
+                    "lead_agentid <> ''",
+                    name_predicate,
+                ])
+                sql = (
+                    "SELECT lead_agentid FROM sme_analytics.sme_leadbookingrevenue "
+                    f"WHERE {where_sql} ORDER BY COALESCE(bookingdate, leaddate) DESC LIMIT 1"
+                )
+                df = self.db.run_query(sql, use_cache=True)
+                if not df.empty:
+                    return str(df.iloc[0, 0])
+
+            # Find the most common matching agent name across columns as a candidate
+            unions = []
+            for col in name_columns:
+                unions.append(
+                    f"SELECT {col} AS name FROM sme_analytics.sme_leadbookingrevenue "
+                    f"WHERE {col} IS NOT NULL AND TRIM(CAST({col} AS VARCHAR)) <> '' "
+                    f"AND LOWER(CAST({col} AS VARCHAR)) LIKE CONCAT('%%', '{name_safe}', '%%')"
+                )
+            union_sql = " UNION ALL ".join(unions)
+            candidate_sql = (
+                f"SELECT name FROM ( {union_sql} ) t WHERE name IS NOT NULL AND TRIM(CAST(name AS VARCHAR)) <> '' "
+                "GROUP BY name ORDER BY COUNT(*) DESC LIMIT 1"
+            )
+            df_names = self.db.run_query(candidate_sql, use_cache=True)
+            if not df_names.empty:
+                best_name = str(df_names.iloc[0, 0]).replace("'", "''").strip().lower()
+                eq_clauses = [f"LOWER(CAST({col} AS VARCHAR)) = '{best_name}'" for col in name_columns]
+                eq_predicate = "( " + " OR ".join(eq_clauses) + " )"
+                sql = (
+                    "SELECT lead_agentid FROM sme_analytics.sme_leadbookingrevenue "
+                    f"WHERE lead_agentid IS NOT NULL AND lead_agentid <> '' AND {eq_predicate} "
+                    "ORDER BY COALESCE(bookingdate, leaddate) DESC LIMIT 1"
+                )
+                df = self.db.run_query(sql, use_cache=True)
+                if not df.empty:
+                    return str(df.iloc[0, 0])
         except Exception as e:
-            print(f"AI Error or JSON parsing failed: {e}")
-            return {"intent": "conversation", "response": "Sorry, I'm having a little trouble thinking right now. Could you please rephrase your request?"}
+            print(f"Agent ID resolution failed: {e}")
+        return None
+
+    def resolve_agent_candidates(self, agent_name: str, products=None, limit: int = 5):
+        """Return a list of candidate agents as dicts: {code: lead_agentid, name: display_name} matching the name."""
+        candidates = []
+        if not agent_name:
+            return candidates
+        try:
+            name_safe = str(agent_name).replace("'", "''").strip().lower()
+            name_columns = [
+                'leadassignedagentname', 'currentlyassigneduser', 'leadreportingmanagername',
+                'leadreportingmanagername2', 'first_assigned_agent', 'booking_agent',
+                'booking_agent_manager', 'booking_agent_manager2'
+            ]
+            like_clauses = [
+                f"LOWER(CAST({col} AS VARCHAR)) LIKE CONCAT('%%', '{name_safe}', '%%')" for col in name_columns
+            ]
+            name_predicate = "( " + " OR ".join(like_clauses) + " )"
+
+            prod_filter = ""
+            if products:
+                ids_csv = ", ".join(str(p) for p in products)
+                prod_filter = f" AND investmenttypeid IN ({ids_csv})"
+
+            # Build canonical name using COALESCE across name columns
+            coalesce_name = (
+                "COALESCE(leadassignedagentname, currentlyassigneduser, leadreportingmanagername, "
+                "leadreportingmanagername2, first_assigned_agent, booking_agent, "
+                "booking_agent_manager, booking_agent_manager2)"
+            )
+            sql = (
+                "SELECT lead_agentid AS code, " + coalesce_name + " AS name, MAX(COALESCE(bookingdate, leaddate)) AS last_dt "
+                "FROM sme_analytics.sme_leadbookingrevenue "
+                f"WHERE lead_agentid IS NOT NULL AND TRIM(lead_agentid) <> '' AND {name_predicate}{prod_filter} "
+                "GROUP BY lead_agentid, " + coalesce_name + " "
+                "ORDER BY last_dt DESC "
+                f"LIMIT {int(max(1, limit))}"
+            )
+            df = self.db.run_query(sql, use_cache=True)
+            if not df.empty:
+                for _, row in df.iterrows():
+                    code = str(row.get('code', '')).strip()
+                    name = str(row.get('name', '')).strip()
+                    if code:
+                        candidates.append({"code": code, "name": name or None})
+        except Exception as e:
+            print(f"Agent candidate resolution failed: {e}")
+        return candidates
+
+    def ai_assisted_agent_name(self, user_text: str) -> str:
+        """Use the AI model to extract the most likely agent name if extractor failed."""
+        try:
+            prompt = f"Extract the agent's full name from this message if present; otherwise return empty. Message: '{user_text}'. Respond with JSON: {{\"name\": \"...\"}}"
+            response = model.generate_content(prompt)
+            txt = (response.text or "").strip().replace('```json','').replace('```','')
+            data = json.loads(txt)
+            name = (data or {}).get('name')
+            if isinstance(name, str) and len(name.strip()) >= 2:
+                return name.strip()
+        except Exception:
+            pass
+        return None
+
+    def fetch_agent_status(self, lead_agentid: str):
+        """Call internal agent tracker API and return parsed JSON list or None."""
+        try:
+            url = f"https://internalagenttracker.policybazaar.com/agentstatus/getagentrealtime/{lead_agentid}"
+            resp = requests.get(url, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict):
+                    return [data]
+        except Exception as e:
+            print(f"Agent status API error: {e}")
+        return None
+
+    def suggest_agent_names(self, name_query: str, limit_names: int = 400, top_k: int = 5):
+        """Suggest closest agent names across known name columns using fuzzy matching."""
+        try:
+            name_query = (name_query or "").strip()
+            if not name_query:
+                return []
+            name_columns = [
+                'leadassignedagentname', 'currentlyassigneduser', 'leadreportingmanagername',
+                'leadreportingmanagername2', 'first_assigned_agent', 'booking_agent',
+                'booking_agent_manager', 'booking_agent_manager2'
+            ]
+            unions = []
+            for col in name_columns:
+                unions.append(
+                    f"SELECT {col} AS name, MAX(COALESCE(bookingdate, leaddate)) AS last_dt FROM sme_analytics.sme_leadbookingrevenue "
+                    f"WHERE {col} IS NOT NULL AND TRIM(CAST({col} AS VARCHAR)) <> '' GROUP BY {col}"
+                )
+            union_sql = " UNION ALL ".join(unions)
+            sql = f"SELECT name FROM ( {union_sql} ) t WHERE name IS NOT NULL GROUP BY name ORDER BY MAX(last_dt) DESC LIMIT {int(limit_names)}"
+            df = self.db.run_query(sql, use_cache=True)
+            names = [str(x) for x in df['name'].tolist() if str(x).strip()]
+            if not names:
+                return []
+            matches = process.extract(name_query, names, scorer=fuzz.WRatio, limit=top_k)
+            # matches: list of tuples (name, score, index)
+            return [m[0] for m in matches if m[1] >= 70]
+        except Exception as e:
+            print(f"Agent name suggestion failed: {e}")
+            return []
+
+    def get_recent_agent_ids_for_products(self, products, limit_per_product=20):
+        """Return a dict product_id -> list of recent distinct lead_agentid values."""
+        results = {}
+        try:
+            if not products:
+                # All products: pick the most recently active distinct agents
+                sql = (
+                    "SELECT lead_agentid, MAX(COALESCE(bookingdate, leaddate)) AS last_dt "
+                    "FROM sme_analytics.sme_leadbookingrevenue "
+                    "WHERE lead_agentid IS NOT NULL AND TRIM(lead_agentid) <> '' "
+                    "GROUP BY lead_agentid "
+                    "ORDER BY last_dt DESC "
+                    f"LIMIT {int(max(1, limit_per_product*3))}"
+                )
+                df = self.db.run_query(sql, use_cache=True)
+                results[None] = [str(x) for x in df['lead_agentid'].tolist() if str(x).strip()]
+                return results
+            for pid in products:
+                sql = (
+                    "SELECT lead_agentid, MAX(COALESCE(bookingdate, leaddate)) AS last_dt "
+                    "FROM sme_analytics.sme_leadbookingrevenue "
+                    f"WHERE investmenttypeid = {int(pid)} AND lead_agentid IS NOT NULL AND TRIM(lead_agentid) <> '' "
+                    "GROUP BY lead_agentid "
+                    "ORDER BY last_dt DESC "
+                    f"LIMIT {int(limit_per_product)}"
+                )
+                df = self.db.run_query(sql, use_cache=True)
+                results[int(pid)] = [str(x) for x in df['lead_agentid'].tolist() if str(x).strip()]
+        except Exception as e:
+            print(f"Agent ID listing failed: {e}")
+        return results
+
+    def extract_agent_codes_from_text(self, text: str, products=None) -> list:
+        """Extract explicit agent codes and resolve any mentioned names to codes."""
+        codes: list = []
+        try:
+            # Explicit codes like PW32306
+            code_tokens = re.findall(r"\b[A-Za-z]{1,6}\d{2,8}\b", text or "")
+            codes.extend(code_tokens)
+            # Naive multi-name extraction after 'for' or comma/and separated
+            names = []
+            m = re.search(r"for\s+(.+)$", text or "", flags=re.IGNORECASE)
+            if m:
+                tail = m.group(1)
+                parts = re.split(r",| and ", tail, flags=re.IGNORECASE)
+                for p in parts:
+                    n = p.strip()
+                    if n and not re.fullmatch(r"[A-Za-z]{1,6}\d{2,8}", n):
+                        names.append(n)
+            # Resolve names to codes (pick the freshest candidate)
+            for name in names:
+                cands = self.resolve_agent_candidates(name, products, limit=1)
+                if cands:
+                    codes.append(cands[0]["code"])
+        except Exception as e:
+            print(f"Agent code extraction failed: {e}")
+        # Deduplicate
+        uniq = []
+        for c in codes:
+            if c not in uniq:
+                uniq.append(c)
+        return uniq
+
+    def parse_agent_fields(self, text: str) -> list:
+        """Parse requested fields from text based on known API keys; default set if none specified."""
+        known = [
+            "AgentCode", "AgentName", "Status", "LastUpdatedOn", "Asterisk_Url", "AgentIP", "CallingCompany",
+            "IsWFH", "IsCustAnswered", "Grade", "Context", "TLName", "VCCount", "VCConnectCount", "UniqueVCCount",
+            "TotalCalls", "UniqueDials", "ConnectedDials", "TotalTalkTime", "OpenLeadCount", "Callableleads", "FutureCB"
+        ]
+        text_l = (text or "").lower()
+        requested = [k for k in known if k.lower() in text_l]
+        if not requested:
+            requested = ["AgentName", "AgentCode", "Status", "ConnectedDials", "TotalTalkTime", "LastUpdatedOn"]
+        return requested
+
+    def parse_status_filter(self, text: str) -> set:
+        """Return a set of desired statuses parsed from text (normalized to upper). Empty means default 'active' set."""
+        t = (text or "").lower()
+        want = set()
+        # Map common words/phrases to status values
+        mapping = {
+            "pause": "PAUSE",
+            "on pause": "PAUSE",
+            "busy": "BUSY",
+            "idle": "IDLE",
+            "available": "AVAILABLE",
+            "ready": "READY",
+            "oncall": "ONCALL",
+            "on call": "ON CALL",
+            "ringing": "RINGING",
+            "tea": "TEA",
+            "unavailable": "UNAVAILABLE",
+        }
+        for key, status in mapping.items():
+            if key in t:
+                want.add(status)
+        return want
+
+    def get_all_agent_ids_for_products(self, products):
+        """Return dict product_id -> all distinct lead_agentid values (no sampling). Potentially slow."""
+        results = {}
+        try:
+            if not products:
+                sql = (
+                    "SELECT DISTINCT lead_agentid FROM sme_analytics.sme_leadbookingrevenue "
+                    "WHERE lead_agentid IS NOT NULL AND TRIM(lead_agentid) <> ''"
+                )
+                print("DEBUG: Fetching ALL agent codes (no product filter)")
+                df = self.db.run_query(sql, use_cache=False)
+                results[None] = [str(x) for x in df.iloc[:, 0].tolist() if str(x).strip()]
+                return results
+            for pid in products:
+                sql = (
+                    "SELECT DISTINCT lead_agentid FROM sme_analytics.sme_leadbookingrevenue "
+                    f"WHERE investmenttypeid = {int(pid)} AND lead_agentid IS NOT NULL AND TRIM(lead_agentid) <> ''"
+                )
+                print(f"DEBUG: Fetching ALL agent codes for product {pid}")
+                df = self.db.run_query(sql, use_cache=False)
+                results[int(pid)] = [str(x) for x in df.iloc[:, 0].tolist() if str(x).strip()]
+        except Exception as e:
+            print(f"Agent ALL ID listing failed: {e}")
+        return results
     
     def execute_sql_query(self, sql_query, explanation):
         sql_query = sql_query.strip().rstrip(';')
@@ -227,159 +448,461 @@ Respond now with only the JSON object."""
             if df.empty:
                 return "No data found for your query.", None, None
 
-            # Generate a masked version of the DataFrame for AI context
             df_masked = masking_service.mask_dataframe(df)
-            
             query_id = hashlib.md5(sql_query.encode()).hexdigest()[:8]
             self.save_query_result(query_id, df_masked, sql_query, explanation)
 
-            # Format the original (unmasked) DataFrame for Slack
             if len(df) == 1 and len(df.columns) == 1:
                 value = df.iloc[0, 0]
-                result_text = f"📊 **Result**: {value:,}\n\n💡 {explanation}\n\n🔍 **Query**:\n```\n{sql_query}\n```"
+                result_text = (
+                    f"📊 **Result**: {value:,}\n\n"
+                    f"💡 {explanation}\n\n"
+                    f"🔍 **Query**:\n```\n{sql_query}\n```\n"
+                    f"📎 Query ID: `{query_id}`"
+                )
             else:
                 table = df.to_string(index=False, max_rows=20)
-                result_text = f"📊 **Results**:\n```\n{table}\n```\n\n💡 {explanation}\n\n📎 Query ID: {query_id}\n\n🔍 **Query**:\n```\n{sql_query}\n```"
+                result_text = (
+                    f"📊 **Results**:\n```\n{table}\n```\n\n"
+                    f"💡 {explanation}\n\n"
+                    f"🔍 **Query**:\n```\n{sql_query}\n```\n"
+                    f"📎 Query ID: `{query_id}`"
+                )
             
-            # Return both the unmasked text for Slack and the masked DataFrame for context
             return result_text, query_id, df_masked
 
         except Exception as e:
             return f"❌ Query failed: {str(e)}", None, None
     
     def save_query_result(self, query_id, df, sql_query, explanation):
-        try:
-            os.makedirs("query_results", exist_ok=True)
-            # Save the masked data to the query results
-            with open(f"query_results/{query_id}.json", "w") as f:
-                json.dump({"data": df.to_dict('records'), "sql": sql_query, "explanation": explanation}, f)
-        except Exception as e:
-            print(f"Failed to save query result: {e}")
+        os.makedirs("query_results", exist_ok=True)
+        with open(f"query_results/{query_id}.json", "w") as f:
+            json.dump({"data": df.to_dict('records'), "sql": sql_query, "explanation": explanation}, f)
 
-    def get_categorical_values_context(self):
-        """Get distinct values from categorical columns to help AI understand user queries"""
-        try:
-            # Get categorical columns from schema
-            categorical_columns = []
-            for col, meta in TABLE_SCHEMA.items():
-                if meta.get("is_categorical", False) and meta.get("pii_level", "none") != "high":
-                    categorical_columns.append(col)
-            
-            if not categorical_columns:
-                return ""
-            
-            # Build context for categorical columns
-            context_parts = []
-            for col in categorical_columns:
-                # Use sample values from config for now (we could fetch real distincts if needed)
-                sample_values = TABLE_SCHEMA[col].get("sample_values", [])
-                if sample_values:
-                    # Take first 10 values to keep context manageable
-                    values_str = ", ".join([f"'{v}'" for v in sample_values[:10]])
-                    context_parts.append(f"- `{col}`: {values_str}")
-            
-            if context_parts:
-                return "\n**Available Categorical Values:**\n" + "\n".join(context_parts)
-            return ""
-            
-        except Exception as e:
-            print(f"Error getting categorical values context: {e}")
-            return ""
+    def get_categorical_values_context(self, dynamic_distincts: dict):
+        context_parts = []
+        for col, meta in TABLE_SCHEMA.items():
+            if meta.get("is_categorical") and meta.get("pii_level") != "high":
+                values = (dynamic_distincts or {}).get(col) or meta.get("sample_values", [])
+                if values:
+                    values_str = ", ".join([f"'{v}'" for v in values[:8]])
+                    context_parts.append(f"- `{col}` can be: {values_str}")
+        if context_parts:
+            return "\n**Categorical Values**:\n" + "\n".join(context_parts)
+        return ""
 
 bot = SimplifiedBot(db_manager)
 
-def run_main_logic(text, user_id, say, product_ids=None):
+
+def looks_like_feedback(message: str) -> bool:
+    text = (message or "").lower()
+    keywords = [
+        "should", "must", "always", "include", "exclude", "prefer",
+        "use like", "use regex", "wrong", "incorrect", "show",
+        "please add", "please use", "make sure"
+    ]
+    return any(k in text for k in keywords)
+
+
+def send_feedback_to_channel(feedback_id: int, user_id: str, original_text: str, entities: dict):
     try:
-        # First, use AI to classify intent intelligently
-        intent_classification = intent_classifier.classify_intent(text, product_ids)
-        print(f"DEBUG: AI Intent Classification: {intent_classification}")
-        
-        intent = intent_classification.get("intent")
-        confidence = intent_classification.get("confidence", 0.5)
-        
-        # If it's feedback, handle it immediately with detailed extraction
-        if intent == "feedback":
-            feedback_details = intent_classifier.get_feedback_details(text, product_ids)
-            print(f"DEBUG: Feedback Details: {feedback_details}")
-            
-            # Store feedback and notify the team
-            feedback_message = feedback_details.get("specific_issue", "User provided feedback")
-            feedback_id = business_logic_manager.store_feedback(
-                user_id=user_id, 
-                original_query=text, 
-                feedback_text=feedback_message, 
-                context={
-                    **user_contexts.get(user_id, {}),
-                    "feedback_type": feedback_details.get("feedback_type"),
-                    "priority": feedback_details.get("priority"),
-                    "business_impact": feedback_details.get("business_impact"),
-                    "extracted_rule": feedback_details.get("extracted_rule")
-                }
-            )
-            
-            # Send notification to feedback channel
-            notification = f"""🔔 *New Feedback for Review* | ID: `{feedback_id}`
-*User*: <@{user_id}>
-*Original Query*: `{text}`
-*Feedback Type*: {feedback_details.get('feedback_type', 'Unknown')}
-*Priority*: {feedback_details.get('priority', 'Medium')}
-*Specific Issue*: {feedback_details.get('specific_issue', 'No specific issue mentioned')}
-*Suggested Solution*: {feedback_details.get('suggested_solution', 'No solution suggested')}
-*Business Impact*: {feedback_details.get('business_impact', 'Unknown')}
-*Extracted Rule*: {feedback_details.get('extracted_rule', 'None')}"""
-            
-            blocks = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": notification}},
-                {"type": "actions", "block_id": f"feedback_actions_{feedback_id}", "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve Logic"}, "action_id": "approve_feedback", "value": str(feedback_id), "style": "primary"},
-                    {"type": "button", "text": {"type": "plain_text", "text": "❌ Reject"}, "action_id": "reject_feedback", "value": str(feedback_id), "style": "danger"}
-                ]}
-            ]
-            
-            app.client.chat_postMessage(
-                channel=FEEDBACK_CHANNEL_ID, 
-                text="New feedback received", 
-                blocks=blocks
-            )
-            
-            say("✅ Thank you for your feedback! It has been submitted for review by the team.")
+        summary_lines = []
+        if entities:
+            if entities.get("products"):
+                summary_lines.append(f"Products: {entities.get('products')}")
+            if entities.get("metric"):
+                summary_lines.append(f"Metric: {entities.get('metric')}")
+            if (entities.get("time") or {}).get("key"):
+                summary_lines.append(f"Time: {(entities.get('time') or {}).get('key')}")
+            if entities.get("dimensions"):
+                summary_lines.append(f"Dimensions: {entities.get('dimensions')}")
+            if entities.get("filters"):
+                summary_lines.append(f"Filters: {entities.get('filters')}")
+        summary = "\n".join(f"• {line}" for line in summary_lines if line)
+
+        notification = (
+            f"🔔 *New Feedback for Review* | ID: `{feedback_id}`\n"
+            f"*User*: <@{user_id}>\n"
+            f"*Original Message*: `{original_text}`\n"
+            f"{summary}"
+        )
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": notification}},
+            {
+                "type": "actions",
+                "block_id": f"feedback_actions_{feedback_id}",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✅ Approve Logic"},
+                        "action_id": "approve_feedback",
+                        "value": str(feedback_id),
+                        "style": "primary",
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "❌ Reject"},
+                        "action_id": "reject_feedback",
+                        "value": str(feedback_id),
+                        "style": "danger",
+                    },
+                ],
+            },
+        ]
+        app.client.chat_postMessage(channel=FEEDBACK_CHANNEL_ID, text="New feedback received", blocks=blocks)
+    except Exception as e:
+        print(f"Failed to post feedback to channel: {e}")
+
+def run_main_logic(text, user_id, say):
+    try:
+        # If user requests main menu/reset within a session
+        lower_text = (text or "").strip().lower()
+        if lower_text in ("menu", "main menu", "start over", "restart", "end session"):
+            if lower_text in ("end session",):
+                USER_SESSIONS.pop(user_id, None)
+                say("✅ Session ended.")
+                debug(f"User {user_id} ended session")
+            show_main_menu(user_id, say)
             return
-        
-        # For other intents, proceed with the original AI response generation
-        ai_response = bot.generate_response(text, user_id, product_ids=product_ids)
+
+        # Route by chosen session mode first (two distinct workflows)
+        mode = (USER_SESSIONS.get(user_id) or {}).get("mode")
+        # Hard route: if the user asks about agent activity, go to agent mode handler regardless
+        if mode == "agent" or any(k in lower_text for k in ["agents active", "active agents", "agents online", "how many agents"]):
+            debug(f"Routing to agent mode (mode={mode}) for user {user_id}")
+            return handle_agent_mode(text, user_id, say)
+
+        # Default/metrics workflow (legacy behavior + clarifications/feedback)
+        entities = bot.process_query_with_ai(text)
+        debug(f"Entities extracted: {entities}")
+
+        # Confidence-based clarification for products
+        if entities.get("intent") == "metric_query" and entities.get("confidence", 0) < 0.6:
+            say("🤔 I might be unsure about your request. Could you specify the product or metric?")
+            return
+
+        # Shortcut: treat suggestions/instructions as feedback even if extractor says clarification
+        if entities.get("intent") == "feedback" or looks_like_feedback(text):
+            try:
+                feedback_id = business_logic_manager.store_feedback(
+                    user_id=user_id,
+                    original_query=text,
+                    feedback_text="User suggestion/feedback",
+                    context={"entities": entities},
+                )
+                if feedback_id:
+                    send_feedback_to_channel(feedback_id, user_id, text, entities)
+            except Exception:
+                pass
+            say("✅ Thanks for the feedback! We'll review and improve this behavior.")
+            return
+
+        # Handle agent status intent
+        if entities.get("intent") == "agent_status":
+            agent_name = ((entities.get("agent") or {}).get("name")) or None
+            if not agent_name:
+                # Try AI-assisted extraction
+                agent_name = bot.ai_assisted_agent_name(text)
+            if agent_name:
+                # Remove trailing "in <something>" fragments and standalone time tokens misparsed as name
+                agent_name = re.sub(r"\bin\s+[A-Za-z\s]+$", "", agent_name, flags=re.IGNORECASE).strip()
+                if agent_name.lower() in ("today", "yesterday", "this week", "this month"):
+                    agent_name = None
+            products = entities.get("products") or []
+            if not agent_name:
+                say("Please specify the agent name, e.g., 'agent status for Sahil Sharma'.")
+                return
+            # If user provided an agent code directly, use it
+            if re.fullmatch(r"[A-Za-z]{1,6}\d{2,8}", agent_name):
+                lead_agentid = agent_name
+                candidate_label = None
+            else:
+                candidates = bot.resolve_agent_candidates(agent_name, products, limit=5)
+                if not candidates:
+                    suggestions = bot.suggest_agent_names(agent_name)
+                    if suggestions:
+                        suggest_text = ", ".join(suggestions)
+                        say(f"Couldn't find any agent for '{agent_name}'. Did you mean: {suggest_text}?")
+                    else:
+                        say(f"Couldn't find any agent for '{agent_name}'. Try the exact name used in CRM or provide agent code.")
+                    return
+                if len(candidates) > 1:
+                    lines = [f"- {c['name'] or 'Unknown'} (code: `{c['code']}`)" for c in candidates]
+                    say("Multiple agents match that name. Please specify the agent code from below:\n" + "\n".join(lines))
+                    return
+                lead_agentid = candidates[0]["code"]
+                candidate_label = candidates[0].get("name")
+
+            status_list = bot.fetch_agent_status(lead_agentid)
+            if not status_list:
+                label = candidate_label or agent_name
+                say(f"No live status found for agent '{label}' (ID: {lead_agentid}).")
+                return
+            s = status_list[0]
+            # Build a concise Slack message
+            fields = []
+            def add_field(title, key):
+                if s.get(key) is not None and s.get(key) != "":
+                    fields.append({"type": "mrkdwn", "text": f"*{title}:* {s.get(key)}"})
+            add_field("Agent", "AgentName")
+            add_field("Code", "AgentCode")
+            add_field("Status", "Status")
+            add_field("Last Updated", "LastUpdatedOn")
+            add_field("On WFH", "IsWFH")
+            add_field("Company", "CallingCompany")
+            add_field("Total Calls", "TotalCalls")
+            add_field("Connected", "ConnectedDials")
+            add_field("Talk Time (s)", "TotalTalkTime")
+            detail_block = {"type": "section", "fields": fields[:10]} if fields else {"type": "section", "text": {"type": "mrkdwn", "text": "No additional details available."}}
+            blocks = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"🔎 Agent live status for *{agent_name}* (ID: `{lead_agentid}`)"}},
+                detail_block,
+            ]
+            say(blocks=blocks, text=f"Agent status for {agent_name}")
+            return
+
+        ai_response = bot.generate_response(text, user_id, product_ids=entities)
         intent = ai_response.get("intent")
         
         if intent == "metric_query":
+            # If the user primarily asked for agent active summary (and no explicit metric), serve that directly
+            wants_agent_summary = (entities.get("flags") or {}).get("agent_active_summary")
+            wants_full = (entities.get("flags") or {}).get("agent_active_summary_full")
+            explicit_metric = ai_response.get("sql") and (entities.get("metric") or entities.get("metrics"))
+            if wants_agent_summary and not explicit_metric:
+                products = entities.get("products") or []
+                if wants_full:
+                    print("DEBUG: Running FULL agent activity scan")
+                    pid_to_agents = bot.get_all_agent_ids_for_products(products)
+                else:
+                    pid_to_agents = bot.get_recent_agent_ids_for_products(products, limit_per_product=15)
+                summary_lines = []
+                for pid, agent_ids in pid_to_agents.items():
+                    active_count = 0
+                    check_ids = agent_ids if wants_full else agent_ids[:15]
+                    print(f"DEBUG: Checking {len(check_ids)} agent codes for product {pid}")
+                    for aid in check_ids:
+                        print(f"DEBUG: Calling status API for {aid}")
+                        status_list = bot.fetch_agent_status(aid)
+                        if not status_list:
+                            continue
+                        s = status_list[0] if isinstance(status_list, list) else status_list
+                        status = str(s.get("Status", "")).upper()
+                        print(f"DEBUG: {aid} -> {status}")
+                        if status in ("READY", "AVAILABLE", "IDLE", "ONCALL", "ON CALL", "BUSY"):
+                            active_count += 1
+                    label = f"Product {pid}" if pid is not None else "All Products"
+                    summary_lines.append(f"- {label}: {active_count} active now (sampled)")
+                text_out = "👥 Agent activity (quick check):\n" + ("\n".join(summary_lines) if summary_lines else "No agents found in recent activity.")
+                say(text_out)
+                return
             sql = ai_response.get("sql")
             explanation = ai_response.get("explanation", "Query executed")
             if sql:
                 result_text, query_id, df_masked = bot.execute_sql_query(sql, explanation)
+                # If the user asked for agent active summary, augment the message
+                if (entities.get("flags") or {}).get("agent_active_summary"):
+                    products = entities.get("products") or []
+                    wants_full = (entities.get("flags") or {}).get("agent_active_summary_full")
+                    if wants_full:
+                        print("DEBUG: Running FULL agent activity scan (augment)")
+                        pid_to_agents = bot.get_all_agent_ids_for_products(products)
+                    else:
+                        pid_to_agents = bot.get_recent_agent_ids_for_products(products, limit_per_product=15)
+                    summary_lines = []
+                    total_active = 0
+                    for pid, agent_ids in pid_to_agents.items():
+                        active_count = 0
+                        check_ids = agent_ids if wants_full else agent_ids[:15]
+                        print(f"DEBUG: Checking {len(check_ids)} agent codes for product {pid}")
+                        for aid in check_ids:
+                            print(f"DEBUG: Calling status API for {aid}")
+                            status_list = bot.fetch_agent_status(aid)
+                            if not status_list:
+                                continue
+                            s = status_list[0] if isinstance(status_list, list) else status_list
+                            status = str(s.get("Status", "")).upper()
+                            print(f"DEBUG: {aid} -> {status}")
+                            if status in ("READY", "AVAILABLE", "IDLE", "ONCALL", "ON CALL", "BUSY"):
+                                active_count += 1
+                        total_active += active_count
+                        label = f"Product {pid}" if pid is not None else "All Products"
+                        summary_lines.append(f"- {label}: {active_count} active now (sampled)")
+                    if summary_lines:
+                        result_text += "\n\n👥 Agent activity (quick check):\n" + "\n".join(summary_lines)
                 
                 if query_id:
-                    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": result_text}}, {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "📥 Download Excel"}, "action_id": "download_excel", "value": query_id}, {"type": "button", "text": {"type": "plain_text", "text": "🔔 Subscribe to Alerts"}, "action_id": "subscribe_alerts", "value": query_id, "style": "primary"}]}]
+                    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": result_text}}, {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "📥 Download Excel"}, "action_id": "download_excel", "value": query_id}, {"type": "button", "text": {"type": "plain_text", "text": "🔔 Subscribe"}, "action_id": "subscribe_alerts", "value": query_id}]}]
                     say(blocks=blocks, text=result_text)
                 else:
                     say(result_text)
-                    
-                # Store the masked result in the user context
-                if df_masked is not None:
-                    user_contexts[user_id] = {"last_query": text, "last_sql": sql, "last_result": df_masked.to_string()}
-                else:
-                    user_contexts[user_id] = {"last_query": text, "last_sql": sql, "last_result": "Query failed"}
             else:
                 say("❌ I couldn't generate a query for that request.")
         elif intent == "conversation":
             say(f"💭 {ai_response.get('response', 'I am here to help!')}")
+        elif intent == "feedback":
+            try:
+                feedback_id = business_logic_manager.store_feedback(user_id, text, "User provided feedback", context={})
+                if feedback_id:
+                    send_feedback_to_channel(feedback_id, user_id, text, {})
+            except Exception:
+                pass
+            say("✅ Thank you for your feedback!")
         elif intent == "clarification":
-            say(f"🤔 {ai_response.get('response', 'Could you please clarify your request?')}")
-        elif intent == "help":
-            say("Here's how I can help...")
+            say("🤔 Noted. I can log this as a suggestion to improve product/insurer matching.")
         else:
             say("🤔 I'm not sure how to help. Try asking about business metrics.")
     
     except Exception as e:
-        print(f"Error in run_main_logic: {e}")
+        debug(f"Error in run_main_logic: {e}")
         say("❌ Something went wrong. Please try again.")
+
+
+def show_main_menu(user_id: str, say):
+    """Present the main menu to select workflow mode."""
+    debug(f"Showing main menu to user {user_id}")
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "👋 What would you like to do?"}},
+        {
+            "type": "actions",
+            "block_id": f"main_menu_{user_id}",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "📈 Metrics"}, "action_id": "choose_metrics", "style": "primary"},
+                {"type": "button", "text": {"type": "plain_text", "text": "🧑‍💼 Agent Status"}, "action_id": "choose_agent_status"},
+                {"type": "button", "text": {"type": "plain_text", "text": "ℹ️ Help"}, "action_id": "show_help"},
+                {"type": "button", "text": {"type": "plain_text", "text": "🛑 End Session"}, "action_id": "end_session"}
+            ],
+        },
+    ]
+    say(blocks=blocks, text="Choose a mode")
+
+
+def handle_agent_mode(text: str, user_id: str, say):
+    """Dedicated agent-status workflow: supports single-agent or active summary."""
+    try:
+        t = (text or "").lower()
+        debug(f"Agent mode input: '{text}' (user {user_id})")
+        # Quick summary intent in agent mode: prefer AI agent.mode if present
+        ents = nlp_extractor.extract(text)
+        agent_ai = ents.get("agent") or {}
+        ai_mode = (agent_ai or {}).get("mode")
+        is_summary = ai_mode == "summary" or any(k in t for k in ["agents active", "active agents", "agents online", "how many agents", "how many agents are on", "number of agents"])
+        if is_summary:
+            # Parse products if present, otherwise all
+            products = ents.get("products") or []
+            wants_full = (agent_ai.get("scan") == "full") or ((ents.get("flags") or {}).get("agent_active_summary_full"))
+            pid_to_agents = (
+                bot.get_all_agent_ids_for_products(products)
+                if wants_full else bot.get_recent_agent_ids_for_products(products, limit_per_product=15)
+            )
+            # Optional: specific agent codes or names requested
+            explicit_codes = list(agent_ai.get("codes") or []) or bot.extract_agent_codes_from_text(text, products)
+            requested_fields = list(agent_ai.get("fields") or []) or bot.parse_agent_fields(text)
+            if ("name" in t or "names" in t) and "AgentName" not in requested_fields:
+                requested_fields = ["AgentName", "AgentCode", "Status"] + [f for f in requested_fields if f not in ("AgentName", "AgentCode", "Status")]
+            summary_lines = []
+            details_lines = []
+            desired_statuses = set([str(s).upper() for s in (agent_ai.get("status_filters") or [])]) or set(bot.parse_status_filter(text))
+            for pid, agent_ids in pid_to_agents.items():
+                active_count = 0
+                check_ids = explicit_codes or (agent_ids if wants_full else agent_ids[:15])
+                debug(f"Agent summary - product={pid} checking {len(check_ids)} codes")
+                for aid in check_ids:
+                    debug(f"Calling status API for {aid}")
+                    status_list = bot.fetch_agent_status(aid)
+                    if not status_list:
+                        continue
+                    s = status_list[0] if isinstance(status_list, list) else status_list
+                    status = str(s.get("Status", "")).upper()
+                    debug(f"{aid} -> {status}")
+                    # If user specified statuses (e.g., 'pause'), count only those; else count the default active set
+                    default_active = {"READY", "AVAILABLE", "IDLE", "ONCALL", "ON CALL", "BUSY"}
+                    if desired_statuses:
+                        if status in desired_statuses:
+                            active_count += 1
+                    else:
+                        if status in default_active:
+                            active_count += 1
+                        # Build a detail line with requested fields
+                        parts = []
+                        for key in requested_fields:
+                            val = s.get(key)
+                            if val is not None and val != "":
+                                if key == "AgentName" and s.get("AgentCode"):
+                                    parts.append(f"{val} ({s.get('AgentCode')})")
+                                elif key not in ("AgentCode",):
+                                    parts.append(f"{key}: {val}")
+                        if parts:
+                            details_lines.append(" - " + " | ".join(parts))
+                label = f"Product {pid}" if pid is not None else "All Products"
+                if desired_statuses:
+                    status_label = "/".join(sorted(desired_statuses))
+                    summary_lines.append(f"- {label}: {active_count} with status {status_label}" + (" (sampled)" if not wants_full and not explicit_codes else ""))
+                else:
+                    summary_lines.append(f"- {label}: {active_count} active now" + (" (sampled)" if not wants_full and not explicit_codes else ""))
+            header = "👥 Agent activity:\n" + ("\n".join(summary_lines) if summary_lines else "No agents found.")
+            # Append details if any
+            if details_lines:
+                # Limit to avoid Slack overflow
+                detail_preview = "\n".join(details_lines[:30])
+                header += "\n\n👤 Active agents (sample):\n" + detail_preview
+            say(header)
+            return
+
+        # Otherwise: single-agent lookup flow (reuse existing logic)
+        entities = nlp_extractor.extract(text)
+        agent_name = ((entities.get("agent") or {}).get("name")) or None
+        if not agent_name:
+            agent_name = bot.ai_assisted_agent_name(text)
+        if agent_name:
+            agent_name = re.sub(r"\bin\s+[A-Za-z\s]+$", "", agent_name, flags=re.IGNORECASE).strip()
+            if agent_name.lower() in ("today", "yesterday", "this week", "this month"):
+                agent_name = None
+        products = entities.get("products") or []
+        if not agent_name:
+            say("Please provide the agent name or code (e.g., 'PW32306').")
+            return
+        # Direct code support
+        if re.fullmatch(r"[A-Za-z]{1,6}\d{2,8}", agent_name):
+            lead_agentid = agent_name
+            candidate_label = None
+        else:
+            candidates = bot.resolve_agent_candidates(agent_name, products, limit=5)
+            if not candidates:
+                suggestions = bot.suggest_agent_names(agent_name)
+                if suggestions:
+                    say("Couldn't find any agent for that name. Did you mean: " + ", ".join(suggestions) + "?")
+                else:
+                    say("Couldn't find any agent for that name. Try exact CRM name or provide agent code.")
+                return
+            if len(candidates) > 1:
+                lines = [f"- {c['name'] or 'Unknown'} (code: `{c['code']}`)" for c in candidates]
+                say("Multiple agents match that name. Please specify the agent code from below:\n" + "\n".join(lines))
+                return
+            lead_agentid = candidates[0]["code"]
+            candidate_label = candidates[0].get("name")
+
+        status_list = bot.fetch_agent_status(lead_agentid)
+        if not status_list:
+            say(f"No live status found for agent (ID: {lead_agentid}).")
+            return
+        s = status_list[0]
+        # Build dynamic fields based on user request
+        requested_fields = bot.parse_agent_fields(text)
+        fields = []
+        for key in requested_fields:
+            if s.get(key) is not None and s.get(key) != "":
+                fields.append({"type": "mrkdwn", "text": f"*{key}:* {s.get(key)}"})
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"🔎 Agent live status (ID: `{lead_agentid}`)"}},
+            {"type": "section", "fields": fields[:10]} if fields else {"type": "section", "text": {"type": "mrkdwn", "text": "No additional details available."}},
+            {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "🏠 Main Menu"}, "action_id": "show_menu"}]}
+        ]
+        say(blocks=blocks, text="Agent status")
+        return
+    except Exception as e:
+        print(f"Error in handle_agent_mode: {e}")
+        say("❌ Something went wrong in agent mode.")
 
 @app.event("app_mention")
 def handle_message(event, say):
@@ -388,71 +911,95 @@ def handle_message(event, say):
     print(f"\n\nDEBUG: ----- NEW MESSAGE RECEIVED -----\nUser: {user_id}\nText: '{text}'\n------------------------------------")
     
     if not text:
-        say("👋 Hi! I can help with business metrics or just chat.")
+        show_main_menu(user_id, say)
         return
     
-    say("🤖 Processing...")
-    
-    product_ids = bot.resolve_products(text)
-    
-    # If no products found, ask for clarification
-    if not product_ids:
-        # Check if this might be a product query that we couldn't match
-        words = re.findall(r'\b\w+\b', text.lower())
-        stop_words = ['leads', 'bookings', 'revenue', 'premium', 'today', 'yesterday', 'week', 'month', 'year', 'this', 'last', 'for', 'in', 'of', 'the', 'a', 'an', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 'have', 'has', 'had', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'tell', 'me', 'what', 'how', 'many', 'much', 'show', 'give', 'get', 'find', 'count', 'sum', 'total', 'average', 'avg', 'max', 'min', 'number', 'seo', 'direct', 'referral', 'brand', 'paid', 'crm', 'fos', 'mobile', 'app', 'marketing', 'campaigns', 'channel', 'system', 'team', 'from', 'came', 'came', 'through', 'via', 'using', 'with', 'by', 'gets', 'getting']
-        potential_products = [word for word in words if len(word) >= 2 and word not in stop_words]
-        
-        if potential_products:
-            # Store the original query for clarification
-            pending_clarifications[user_id] = {
-                "original_query": text,
-                "potential_products": potential_products,
-                "timestamp": time.time()
-            }
-            
-            blocks = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"🤔 I'm not sure which product you mean by '{potential_products[0]}'. Could you clarify?"}},
-                {"type": "actions", "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": "❌ No, let me rephrase"}, "action_id": "clarification_no", "value": user_id},
-                    {"type": "button", "text": {"type": "plain_text", "text": "💡 Show me available products"}, "action_id": "show_products", "value": user_id}
-                ]}
-            ]
-            say(blocks=blocks, text=f"I'm not sure which product you mean by '{potential_products[0]}'. Could you clarify?")
-            return
-        else:
-            # No potential products found, run without filter
-            run_main_logic(text, user_id, say)
-            return
-    
-    # If multiple products found, run with all of them
-    if len(product_ids) > 1:
-        run_main_logic(text, user_id, say, product_ids=product_ids)
+    # If text equals 'menu', show menu; otherwise process
+    if text.strip().lower() in ("menu", "main menu", "start over", "restart"):
+        show_main_menu(user_id, say)
         return
-    
-    # For single product, proceed normally
-    run_main_logic(text, user_id, say, product_ids=product_ids)
 
+    # If no mode chosen yet, route smartly or show menu
+    mode = (USER_SESSIONS.get(user_id) or {}).get("mode")
+    if not mode:
+        tl = text.lower()
+        if any(k in tl for k in ["agents active", "active agents", "agents online", "how many agents"]):
+            return handle_agent_mode(text, user_id, say)
+        show_main_menu(user_id, say)
+        return
+
+    debug(f"Routing to run_main_logic for user {user_id} (mode={mode})")
+    say("🤖 Processing...")
+    run_main_logic(text, user_id, say)
+
+# All other handlers (subscribe, feedback, etc.) remain the same
+
+# Action: Download Excel for last query result
 @app.action("download_excel")
 def handle_download_excel(ack, body, say):
     ack()
-    query_id = body["actions"][0]["value"]
     try:
+        query_id = body["actions"][0]["value"]
         with open(f"query_results/{query_id}.json", "r") as f:
-            df = pd.DataFrame(json.load(f)["data"])
-        excel_path = f"temp_exports/{query_id}.xlsx"
-        df.to_excel(excel_path, index=False)
-        app.client.files_upload_v2(channel=body["channel"]["id"], file=excel_path, filename=f"query_result_{query_id}.xlsx", initial_comment="📊 Here's your data!", thread_ts=body["message"]["ts"])
-        os.remove(excel_path)
+            payload = json.load(f)
+        df = pd.DataFrame(payload.get("data", []))
+        export_path = f"temp_exports/{query_id}.xlsx"
+        os.makedirs("temp_exports", exist_ok=True)
+        df.to_excel(export_path, index=False)
+        app.client.files_upload_v2(
+            channel=body["channel"]["id"],
+            file=export_path,
+            filename=f"query_result_{query_id}.xlsx",
+            initial_comment="📊 Here's your data!",
+            thread_ts=body["message"]["ts"],
+        )
+        try:
+            os.remove(export_path)
+        except Exception:
+            pass
     except Exception as e:
-        say(f"❌ Failed to generate Excel file: {e}", thread_ts=body["message"]["ts"])
+        say(f"❌ Failed to generate Excel file: {e}", thread_ts=body.get("message", {}).get("ts"))
 
+
+# Action: Subscribe to alerts
 @app.action("subscribe_alerts")
 def handle_subscribe_alerts(ack, body, client):
     ack()
     try:
-        client.views_open(trigger_id=body["trigger_id"], view={"type": "modal", "callback_id": "submit_subscription", "title": {"type": "plain_text", "text": "Subscribe to Alerts"}, "submit": {"type": "plain_text", "text": "Subscribe"}, "blocks": [{"type": "input", "block_id": "frequency_block", "label": {"type": "plain_text", "text": "How often?"}, "element": {"type": "static_select", "action_id": "frequency_select", "options": [{"text": {"type": "plain_text", "text": "Hourly"}, "value": "hourly"}, {"text": {"type": "plain_text", "text": "Daily (at 9 AM)"}, "value": "daily"}, {"text": {"type": "plain_text", "text": "Weekly (Mondays at 9 AM)"}, "value": "weekly"}]}}], "private_metadata": json.dumps({"query_id": body["actions"][0]["value"], "channel_id": body["channel"]["id"]})})
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": "submit_subscription",
+                "title": {"type": "plain_text", "text": "Subscribe to Alerts"},
+                "submit": {"type": "plain_text", "text": "Subscribe"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "frequency_block",
+                        "label": {"type": "plain_text", "text": "How often?"},
+                        "element": {
+                            "type": "static_select",
+                            "action_id": "frequency_select",
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Hourly"}, "value": "hourly"},
+                                {"text": {"type": "plain_text", "text": "Daily (9 AM)"}, "value": "daily"},
+                                {"text": {"type": "plain_text", "text": "Weekly (Mon 9 AM)"}, "value": "weekly"},
+                            ],
+                        },
+                    }
+                ],
+                "private_metadata": json.dumps(
+                    {
+                        "query_id": body["actions"][0]["value"],
+                        "channel_id": body["channel"]["id"],
+                    }
+                ),
+            },
+        )
     except Exception as e:
-        print(f"Error opening view: {e}")
+        print(f"Error opening subscription view: {e}")
+
 
 @app.view("submit_subscription")
 def handle_subscription_submission(ack, body, say):
@@ -462,99 +1009,84 @@ def handle_subscription_submission(ack, body, say):
         metadata = json.loads(body["view"]["private_metadata"])
         query_id = metadata["query_id"]
         channel_id = metadata["channel_id"]
-        selected_frequency = body["view"]["state"]["values"]["frequency_block"]["frequency_select"]["selected_option"]["value"]
+        selected_frequency = (
+            body["view"]["state"]["values"]["frequency_block"]["frequency_select"]["selected_option"]["value"]
+        )
         with open(f"query_results/{query_id}.json", "r") as f:
             query_context = json.load(f)
-        subscription_id = subscription_manager.add_subscription(user_id, channel_id, query_context, selected_frequency)
-        if subscription_id:
-            say(channel=channel_id, text=f"✅ You are now subscribed to **{selected_frequency}** alerts for this metric. Your subscription ID is `{subscription_id}`.")
+        sub_id = subscription_manager.add_subscription(user_id, channel_id, query_context, selected_frequency)
+        if sub_id:
+            say(channel=channel_id, text=f"✅ Subscribed to {selected_frequency} alerts. ID: `{sub_id}`")
         else:
             say(channel=channel_id, text="❌ Unable to create your subscription.")
     except Exception as e:
         print(f"Error creating subscription: {e}")
-        say(channel=metadata.get("channel_id", user_id), text="An error occurred.")
+        say(channel=user_id, text="An error occurred creating your subscription.")
 
-@app.command("/unsubscribe")
-def handle_unsubscribe_command(ack, say, command):
-    ack()
-    user_id = command["user_id"]
-    subscriptions = subscription_manager.get_user_subscriptions(user_id)
-    if not subscriptions:
-        say("You have no active subscriptions.")
-        return
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "Here are your active subscriptions. Click to unsubscribe."}}]
-    for sub in subscriptions:
-        blocks.append({"type": "divider"})
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"ID: {sub['id']} - {sub.get('metric')} for {sub.get('product')}"}, "accessory": {"type": "button", "text": {"type": "plain_text", "text": "Unsubscribe"}, "value": str(sub['id']), "action_id": "unsubscribe"}})
-    say(blocks=blocks)
 
-@app.action("unsubscribe")
-def handle_unsubscribe(ack, body, say):
-    ack()
-    subscription_id = int(body["actions"][0]["value"])
-    if subscription_manager.remove_subscription(subscription_id):
-        say(f"✅ Unsubscribed from alert {subscription_id}.", thread_ts=body["message"]["ts"])
-    else:
-        say(f"❌ Unable to remove subscription.", thread_ts=body["message"]["ts"])
-
+# Approve/Reject feedback actions
 @app.action("approve_feedback")
 def handle_approve_feedback(ack, body, say):
     ack()
-    feedback_id = int(body["actions"][0]["value"])
-    if business_logic_manager.update_feedback_status(feedback_id, "approved"):
-        say(text=f"✅ Feedback ID `{feedback_id}` has been approved.", thread_ts=body["message"]["ts"])
-    else:
-        say(text=f"❌ Could not find feedback with ID `{feedback_id}`.", thread_ts=body["message"]["ts"])
+    try:
+        feedback_id = int(body["actions"][0]["value"])
+        ok = business_logic_manager.update_feedback_status(feedback_id, "approved")
+        say(text=("✅ Feedback approved." if ok else "❌ Could not approve feedback."), thread_ts=body.get("message", {}).get("ts"))
+    except Exception as e:
+        say(text=f"❌ Error approving feedback: {e}", thread_ts=body.get("message", {}).get("ts"))
+
 
 @app.action("reject_feedback")
 def handle_reject_feedback(ack, body, say):
     ack()
-    feedback_id = int(body["actions"][0]["value"])
-    if business_logic_manager.update_feedback_status(feedback_id, "rejected"):
-        say(text=f"❌ Feedback ID `{feedback_id}` has been rejected.", thread_ts=body["message"]["ts"])
-    else:
-        say(text=f"❌ Could not find feedback with ID `{feedback_id}`.", thread_ts=body["message"]["ts"])
+    try:
+        feedback_id = int(body["actions"][0]["value"])
+        ok = business_logic_manager.update_feedback_status(feedback_id, "rejected")
+        say(text=("🗑️ Feedback rejected." if ok else "❌ Could not reject feedback."), thread_ts=body.get("message", {}).get("ts"))
+    except Exception as e:
+        say(text=f"❌ Error rejecting feedback: {e}", thread_ts=body.get("message", {}).get("ts"))
 
-@app.action("clarification_no")
-def handle_clarification_no(ack, body, say):
+# Main menu actions
+@app.action("choose_metrics")
+def handle_choose_metrics(ack, body, say):
     ack()
-    user_id = body["actions"][0]["value"]
-    if user_id in pending_clarifications:
-        del pending_clarifications[user_id]
-    say("👍 No problem! Please rephrase your question with a clearer product name.")
+    user_id = body.get("user", {}).get("id") or body.get("user", {}).get("user_id")
+    USER_SESSIONS[user_id] = {"mode": "metrics"}
+    say("✅ Metrics mode selected. Ask your question (e.g., 'marine bookings yesterday'). Type 'menu' anytime to switch.")
 
-@app.action("show_products")
-def handle_show_products(ack, body, say):
+@app.action("choose_agent_status")
+def handle_choose_agent_status(ack, body, say):
     ack()
-    user_id = body["actions"][0]["value"]
-    
-    # Show available products
-    product_list = []
-    for alias, product_id in PRODUCTS.items():
-        if len(alias) > 2:  # Skip very short aliases
-            product_list.append(f"• {alias}")
-    
-    # Take first 20 products to avoid message too long
-    product_text = "\n".join(product_list[:20])
-    
-    say(f"📋 Here are some available products you can ask about:\n\n{product_text}\n\n💡 You can also use abbreviations like 'ghi', 'wc', 'fire', 'marine', etc.")
+    user_id = body.get("user", {}).get("id") or body.get("user", {}).get("user_id")
+    USER_SESSIONS[user_id] = {"mode": "agent"}
+    say("✅ Agent mode selected. Ask 'agent status for <name>' or 'agents active now'. Type 'menu' anytime to switch.")
 
-# --- All other handlers (subscribe, feedback, etc.) would go here ---
+@app.action("show_help")
+def handle_show_help(ack, body, say):
+    ack()
+    help_text = (
+        "• Metrics: ask for leads/bookings/revenue with products/time/dimensions.\n"
+        "• Agent: ask for 'agent status for <name>' or 'agents active now'.\n"
+        "• Type 'menu' to switch modes; 'end session' to reset."
+    )
+    say(help_text)
+
+@app.action("end_session")
+def handle_end_session(ack, body, say):
+    ack()
+    user_id = body.get("user", {}).get("id") or body.get("user", {}).get("user_id")
+    USER_SESSIONS.pop(user_id, None)
+    say("🛑 Session ended.")
 
 if __name__ == "__main__":
-    import threading
-
-    def run_scheduler(db_manager):
-        while True:
-            time.sleep(60)
-
     print("🚀 Starting Simplified ThinkTank Bot...")
     os.makedirs("query_results", exist_ok=True)
     os.makedirs("temp_exports", exist_ok=True)
-
-    scheduler_thread = threading.Thread(target=run_scheduler, args=(db_manager,), daemon=True)
-    scheduler_thread.start()
-
-    print("🎯 Bot ready to serve!")
+    # Optional prewarm controlled by env
+    try:
+        if os.getenv('PREWARM_DISTINCTS', 'false').lower() == 'true':
+            distinct_cache.prewarm_async()
+    except Exception:
+        pass
     handler = SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN"))
     handler.start()

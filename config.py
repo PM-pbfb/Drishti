@@ -135,16 +135,16 @@ TABLE_SCHEMA = {
     "leadmonth": {
         "data_type": "string",
         "is_categorical": True,
-        "value_format": "MMMM",
+        "value_format": "MMMM-YYYY",
         "description": "Month of the lead.",
         "pii_level": "low",
         "masking_strategy": "faker",
         "sample_values": [
-            "October",
-            "November",
-            "December",
-            "January",
-            "February"
+            "October-2019",
+            "November-2020",
+            "December-2025",
+            "January-2024",
+            "February-2026"
         ]
     },
     "lead_year": {
