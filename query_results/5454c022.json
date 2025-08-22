@@ -1,0 +1,1 @@
+{"data": [{"conversion_rate": 18.7}], "sql": "SELECT (COUNT(CASE WHEN booking_status='IssuedBusiness' THEN 1 END) * 100.0 / COUNT(*)) as conversion_rate FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (13) AND DATE(leaddate) = CURRENT_DATE - INTERVAL '1' DAY", "explanation": "Metric: conversion_rate; Products: [13]; Time: yesterday"}

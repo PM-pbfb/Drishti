@@ -48,6 +48,99 @@ from distinct_cache import distinct_cache
 
 # Simple in-memory session store for per-user mode
 USER_SESSIONS = {}
+# Per-user query cache keyed by sql hash (query_id)
+USER_QUERY_CACHE = {}
+
+
+def build_schema_markdown() -> str:
+    """Return a markdown representation of the allowed table schema."""
+    try:
+        header = "📚 Database Schema for `sme_analytics.sme_leadbookingrevenue`:"
+        lines = []
+        for col, meta in TABLE_SCHEMA.items():
+            data_type = meta.get("data_type", "unknown")
+            pii = meta.get("pii_level", "none")
+            desc = meta.get("description", "")
+            lines.append(f"- `{col}` ({data_type}) [pii: {pii}] - {desc}")
+        return header + "\n" + "\n".join(lines)
+    except Exception as e:
+        return f"❌ Failed to render schema: {e}"
+
+
+def send_schema(say):
+    """Send schema to Slack with a download action."""
+    text = build_schema_markdown()
+    def chunk_text(s: str, limit: int = 2500):
+        parts = []
+        while s:
+            parts.append(s[:limit])
+            s = s[limit:]
+        return parts
+    chunks = chunk_text(text)
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": ch}} for ch in chunks]
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "📥 Download Schema (CSV)"}, "action_id": "download_schema", "value": "schema_csv"}
+        ]
+    })
+    say(blocks=blocks, text=chunks[0] if chunks else text)
+
+def merge_entities_for_correction(base: dict, delta: dict, feedback_text: str) -> dict:
+    """Merge user feedback-derived entities (delta) into the last query entities (base)."""
+    result = dict(base or {})
+    t = (feedback_text or "").lower()
+
+    # Helper to deep copy nested maps
+    def _clone_map(m):
+        return {k: (v.copy() if isinstance(v, dict) else (v[:] if isinstance(v, list) else v)) for k, v in (m or {}).items()}
+
+    # Products
+    if any(k in t for k in ["all products", "all subproducts", "across products", "remove product", "remove products", "overall products", "overall subproducts"]):
+        result["products"] = []
+    elif delta.get("products"):
+        result["products"] = list(delta.get("products") or [])
+
+    # Metric / metrics
+    if delta.get("metrics"):
+        result["metrics"] = list(delta.get("metrics") or [])
+        result.pop("metric", None)
+    elif delta.get("metric"):
+        result["metric"] = delta.get("metric")
+        result.pop("metrics", None)
+
+    # Time
+    time_new = dict(result.get("time") or {})
+    for k in ("key", "start_date", "end_date", "granularity"):
+        if (delta.get("time") or {}).get(k) is not None:
+            time_new[k] = (delta.get("time") or {}).get(k)
+    result["time"] = time_new
+
+    # Dimensions
+    if delta.get("dimensions"):
+        result["dimensions"] = list(delta.get("dimensions") or [])
+
+    # Flags
+    flags_new = _clone_map(result.get("flags") or {})
+    for k, v in (delta.get("flags") or {}).items():
+        flags_new[k] = v
+    result["flags"] = flags_new
+
+    # Filters
+    filters_new = _clone_map(result.get("filters") or {})
+    for k, v in (delta.get("filters") or {}).items():
+        if k == "_fuzzy_value":
+            # Overwrite fuzzy value with the latest user guidance
+            filters_new[k] = v
+        else:
+            # Merge lists for categorical filters
+            existing = set(filters_new.get(k) or [])
+            for item in (v or []):
+                existing.add(item)
+            filters_new[k] = list(existing)
+    result["filters"] = filters_new
+
+    return result
 
 # Lightweight debug logger
 def debug(message: str):
@@ -66,6 +159,37 @@ class SimplifiedBot:
         # Two-stage: extract entities only
         entities = nlp_extractor.extract(text)
         return entities
+
+    def resolve_products(self, text: str) -> list:
+        """Return list of canonical product IDs extracted from text using deterministic alias matching."""
+        try:
+            t = (text or "").lower()
+            # Normalize separators
+            import re as _re
+            # Collect aliases grouped by product id
+            pid_to_aliases: dict[int, list[str]] = {}
+            for alias, pid in PRODUCTS.items():
+                try:
+                    pid_int = int(pid)
+                except Exception:
+                    continue
+                pid_to_aliases.setdefault(pid_int, []).append(str(alias).lower())
+
+            found: set[int] = set()
+            # Check longer aliases first to avoid partial overshadow
+            for pid, aliases in pid_to_aliases.items():
+                aliases_sorted = sorted(aliases, key=lambda a: len(a), reverse=True)
+                for a in aliases_sorted:
+                    if not a:
+                        continue
+                    # Build word-boundary regex. Allow spaces and hyphens inside alias tokens
+                    pattern = r"\\b" + _re.escape(a).replace("\\ ", "\\s+") + r"\\b"
+                    if _re.search(pattern, t, flags=_re.IGNORECASE):
+                        found.add(pid)
+                        break
+            return sorted(list(found))
+        except Exception:
+            return []
 
     def generate_response(self, user_text, user_id, product_ids=None):
         """Single AI call to handle all user requests with a more robust prompt."""
@@ -211,51 +335,77 @@ class SimplifiedBot:
         return None
 
     def resolve_agent_candidates(self, agent_name: str, products=None, limit: int = 5):
-        """Return a list of candidate agents as dicts: {code: lead_agentid, name: display_name} matching the name."""
-        candidates = []
+        """Return a list of candidate agents using fuzzy name selection, then resolve to codes.
+        Output: [{code, name}]"""
+        results: list[dict] = []
         if not agent_name:
-            return candidates
+            return results
         try:
-            name_safe = str(agent_name).replace("'", "''").strip().lower()
+            # 1) Fetch recent distinct agent names (agent-centric columns only)
             name_columns = [
-                'leadassignedagentname', 'currentlyassigneduser', 'leadreportingmanagername',
-                'leadreportingmanagername2', 'first_assigned_agent', 'booking_agent',
-                'booking_agent_manager', 'booking_agent_manager2'
+                'leadassignedagentname', 'currentlyassigneduser', 'first_assigned_agent',
+                'booking_agent', 'booking_agent_manager', 'booking_agent_manager2'
             ]
-            like_clauses = [
-                f"LOWER(CAST({col} AS VARCHAR)) LIKE CONCAT('%%', '{name_safe}', '%%')" for col in name_columns
-            ]
-            name_predicate = "( " + " OR ".join(like_clauses) + " )"
-
-            prod_filter = ""
-            if products:
-                ids_csv = ", ".join(str(p) for p in products)
-                prod_filter = f" AND investmenttypeid IN ({ids_csv})"
-
-            # Build canonical name using COALESCE across name columns
-            coalesce_name = (
-                "COALESCE(leadassignedagentname, currentlyassigneduser, leadreportingmanagername, "
-                "leadreportingmanagername2, first_assigned_agent, booking_agent, "
-                "booking_agent_manager, booking_agent_manager2)"
+            unions = []
+            for col in name_columns:
+                unions.append(
+                    f"SELECT {col} AS name, MAX(COALESCE(bookingdate, leaddate)) AS last_dt FROM sme_analytics.sme_leadbookingrevenue "
+                    f"WHERE {col} IS NOT NULL AND TRIM(CAST({col} AS VARCHAR)) <> '' GROUP BY {col}"
+                )
+            union_sql = " UNION ALL ".join(unions)
+            pool_sql = (
+                f"SELECT name FROM ( {union_sql} ) t WHERE name IS NOT NULL GROUP BY name ORDER BY MAX(last_dt) DESC LIMIT {max(200, limit*50)}"
             )
-            sql = (
-                "SELECT lead_agentid AS code, " + coalesce_name + " AS name, MAX(COALESCE(bookingdate, leaddate)) AS last_dt "
-                "FROM sme_analytics.sme_leadbookingrevenue "
-                f"WHERE lead_agentid IS NOT NULL AND TRIM(lead_agentid) <> '' AND {name_predicate}{prod_filter} "
-                "GROUP BY lead_agentid, " + coalesce_name + " "
-                "ORDER BY last_dt DESC "
-                f"LIMIT {int(max(1, limit))}"
-            )
-            df = self.db.run_query(sql, use_cache=True)
-            if not df.empty:
-                for _, row in df.iterrows():
-                    code = str(row.get('code', '')).strip()
-                    name = str(row.get('name', '')).strip()
-                    if code:
-                        candidates.append({"code": code, "name": name or None})
+            df_pool = self.db.run_query(pool_sql, use_cache=True)
+            all_names = [str(x) for x in df_pool['name'].tolist() if str(x).strip()]
+            if not all_names:
+                return []
+
+            # 2) Fuzzy score against the pool
+            query_norm = " ".join(str(agent_name).lower().split())
+            def trigrams(s: str) -> set:
+                s2 = s.replace(" ", "").lower()
+                return {s2[i:i+3] for i in range(len(s2)-2)} if len(s2) >= 3 else set()
+            q_tris = trigrams(query_norm)
+            scored = []
+            for nm in all_names:
+                nm_norm = " ".join(nm.lower().split())
+                score = max(fuzz.WRatio(query_norm, nm_norm), fuzz.token_set_ratio(query_norm, nm_norm))
+                if len(query_norm) >= 5 and nm_norm[:1] != query_norm[:1]:
+                    if not (q_tris and (q_tris & trigrams(nm_norm))):
+                        continue
+                if score >= 88:
+                    scored.append((nm, score))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            top_names = [n for n, _ in scored[:limit]]
+            if not top_names:
+                return []
+
+            # 3) Resolve each top name to the freshest code
+            for nm in top_names:
+                nm_safe = nm.replace("'", "''")
+                equals = [f"LOWER(CAST({col} AS VARCHAR)) = '{nm_safe.lower()}'" for col in name_columns]
+                prod_filter = ""
+                if products:
+                    ids_csv = ", ".join(str(p) for p in products)
+                    prod_filter = f" AND investmenttypeid IN ({ids_csv})"
+                sql = (
+                    "SELECT lead_agentid AS code FROM sme_analytics.sme_leadbookingrevenue "
+                    f"WHERE lead_agentid IS NOT NULL AND TRIM(lead_agentid) <> '' AND (" + " OR ".join(equals) + f"){prod_filter} "
+                    "ORDER BY COALESCE(bookingdate, leaddate) DESC LIMIT 1"
+                )
+                try:
+                    df_code = self.db.run_query(sql, use_cache=True)
+                    if not df_code.empty:
+                        code = str(df_code.iloc[0, 0]).strip()
+                        if code:
+                            results.append({"code": code, "name": nm})
+                except Exception:
+                    continue
+            return results[:limit]
         except Exception as e:
             print(f"Agent candidate resolution failed: {e}")
-        return candidates
+            return results
 
     def ai_assisted_agent_name(self, user_text: str) -> str:
         """Use the AI model to extract the most likely agent name if extractor failed."""
@@ -309,9 +459,32 @@ class SimplifiedBot:
             names = [str(x) for x in df['name'].tolist() if str(x).strip()]
             if not names:
                 return []
-            matches = process.extract(name_query, names, scorer=fuzz.WRatio, limit=top_k)
-            # matches: list of tuples (name, score, index)
-            return [m[0] for m in matches if m[1] >= 70]
+            # Normalize
+            q_norm = name_query.lower().strip()
+            def norm(s: str) -> str:
+                return " ".join(str(s).lower().split())
+            # Pre-compute trigrams for stricter similarity
+            def trigrams(s: str) -> set:
+                s2 = s.replace(" ", "")
+                return {s2[i:i+3] for i in range(len(s2)-2)} if len(s2) >= 3 else set()
+            q_tris = trigrams(q_norm)
+
+            scored = []
+            for n in names:
+                n_norm = norm(n)
+                score_a = fuzz.WRatio(q_norm, n_norm)
+                score_b = fuzz.token_set_ratio(q_norm, n_norm)
+                score = max(score_a, score_b)
+                # Additional guards to avoid poor suggestions like very short or different initials
+                if len(q_norm) >= 5:
+                    if n_norm[:1] != q_norm[:1]:
+                        # Allow if there is decent trigram overlap
+                        if not (q_tris and (q_tris & trigrams(n_norm))):
+                            continue
+                if score >= 85:
+                    scored.append((n, score))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            return [n for n, _ in scored[:top_k]]
         except Exception as e:
             print(f"Agent name suggestion failed: {e}")
             return []
@@ -440,17 +613,26 @@ class SimplifiedBot:
             print(f"Agent ALL ID listing failed: {e}")
         return results
     
-    def execute_sql_query(self, sql_query, explanation):
+    def execute_sql_query(self, sql_query, explanation, user_id: str = None, allow_personal_cache: bool = True):
         sql_query = sql_query.strip().rstrip(';')
         print(f"DEBUG: ----- EXECUTING SQL -----\n{sql_query}\nDEBUG: -------------------------")
         try:
-            df = self.db.run_query(sql_query)
+            # Use per-user cache only if explicitly allowed and present
+            query_id = hashlib.md5(sql_query.encode()).hexdigest()[:8]
+            if allow_personal_cache and user_id and USER_QUERY_CACHE.get(user_id, {}).get(query_id):
+                cached = USER_QUERY_CACHE[user_id][query_id]
+                df_masked = pd.DataFrame(cached.get("data", []))
+                result_text = cached.get("result_text")
+                explanation = cached.get("explanation", explanation)
+                return result_text, query_id, df_masked
+
+            # Always bypass global cache for interactive user queries
+            df = self.db.run_query(sql_query, use_cache=False)
             if df.empty:
                 return "No data found for your query.", None, None
 
             df_masked = masking_service.mask_dataframe(df)
-            query_id = hashlib.md5(sql_query.encode()).hexdigest()[:8]
-            self.save_query_result(query_id, df_masked, sql_query, explanation)
+            self.save_query_result(query_id, df, df_masked, sql_query, explanation)
 
             if len(df) == 1 and len(df.columns) == 1:
                 value = df.iloc[0, 0]
@@ -474,10 +656,15 @@ class SimplifiedBot:
         except Exception as e:
             return f"❌ Query failed: {str(e)}", None, None
     
-    def save_query_result(self, query_id, df, sql_query, explanation):
+    def save_query_result(self, query_id, df_original, df_masked, sql_query, explanation):
         os.makedirs("query_results", exist_ok=True)
         with open(f"query_results/{query_id}.json", "w") as f:
-            json.dump({"data": df.to_dict('records'), "sql": sql_query, "explanation": explanation}, f)
+            json.dump({
+                "data_unmasked": df_original.to_dict('records'),
+                "data": df_masked.to_dict('records'), 
+                "sql": sql_query, 
+                "explanation": explanation
+            }, f)
 
     def get_categorical_values_context(self, dynamic_distincts: dict):
         context_parts = []
@@ -497,15 +684,16 @@ bot = SimplifiedBot(db_manager)
 def looks_like_feedback(message: str) -> bool:
     text = (message or "").lower()
     keywords = [
-        "should", "must", "always", "include", "exclude", "prefer",
-        "use like", "use regex", "wrong", "incorrect", "show",
-        "please add", "please use", "make sure"
+        "should", "should have", "supposed to", "must", "always", "include", "exclude", "prefer",
+        "use like", "use regex", "use ", "filter by", "group by", "remove product", "wrong", "incorrect", "show",
+        "please add", "please use", "make sure", "instead"
     ]
     return any(k in text for k in keywords)
 
 
-def send_feedback_to_channel(feedback_id: int, user_id: str, original_text: str, entities: dict):
+def send_feedback_to_channel(feedback_id: int, user_id: str, original_text: str, entities: dict, context: dict | None = None):
     try:
+        ctx = context or {}
         summary_lines = []
         if entities:
             if entities.get("products"):
@@ -518,6 +706,15 @@ def send_feedback_to_channel(feedback_id: int, user_id: str, original_text: str,
                 summary_lines.append(f"Dimensions: {entities.get('dimensions')}")
             if entities.get("filters"):
                 summary_lines.append(f"Filters: {entities.get('filters')}")
+        # Include SQL/explanation/reason if present in context
+        if ctx.get("sql"):
+            summary_lines.append(f"SQL: ```{ctx.get('sql')}```")
+        if ctx.get("explanation"):
+            summary_lines.append(f"Explanation: {ctx.get('explanation')}")
+        if ctx.get("reason"):
+            summary_lines.append(f"Reason: {ctx.get('reason')}")
+        if ctx.get("query_id"):
+            summary_lines.append(f"Query ID: `{ctx.get('query_id')}`")
         summary = "\n".join(f"• {line}" for line in summary_lines if line)
 
         notification = (
@@ -565,6 +762,11 @@ def run_main_logic(text, user_id, say):
             show_main_menu(user_id, say)
             return
 
+        # QUICK SCHEMA REQUESTS IN METRICS FLOW
+        if any(k in lower_text for k in ["show schema", "schema", "database schema", "table schema", "columns list", "list columns"]):
+            send_schema(say)
+            return
+
         # Route by chosen session mode first (two distinct workflows)
         mode = (USER_SESSIONS.get(user_id) or {}).get("mode")
         # Hard route: if the user asks about agent activity, go to agent mode handler regardless
@@ -583,18 +785,54 @@ def run_main_logic(text, user_id, say):
 
         # Shortcut: treat suggestions/instructions as feedback even if extractor says clarification
         if entities.get("intent") == "feedback" or looks_like_feedback(text):
+            # 1) Store feedback and notify experts
             try:
                 feedback_id = business_logic_manager.store_feedback(
                     user_id=user_id,
                     original_query=text,
-                    feedback_text="User suggestion/feedback",
+                    feedback_text="User correction/suggestion",
                     context={"entities": entities},
                 )
                 if feedback_id:
                     send_feedback_to_channel(feedback_id, user_id, text, entities)
             except Exception:
                 pass
-            say("✅ Thanks for the feedback! We'll review and improve this behavior.")
+            
+            # 2) Attempt to parse corrective entities from the feedback and rerun query immediately
+            try:
+                correction_entities = bot.process_query_with_ai(text)
+            except Exception:
+                correction_entities = {}
+            # Merge with prior entities to preserve context
+            corrected = merge_entities_for_correction(entities, correction_entities, text)
+            # Build SQL with corrected entities
+            sql_payload = build_sql(corrected or {})
+            if sql_payload.get("intent") == "metric_query" and sql_payload.get("sql"):
+                result_text, query_id, df_masked = bot.execute_sql_query(sql_payload["sql"], sql_payload.get("explanation", "Query executed"), user_id=user_id, allow_personal_cache=False)
+                if query_id:
+                    # Show same action buttons including feedback buttons
+                    def chunk_text(s: str, limit: int = 2500):
+                        parts = []
+                        while s:
+                            parts.append(s[:limit])
+                            s = s[limit:]
+                        return parts
+                    chunks = chunk_text(result_text)
+                    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": ch}} for ch in chunks]
+                    blocks.append({
+                        "type": "actions",
+                        "elements": [
+                            {"type": "button", "text": {"type": "plain_text", "text": "✅ Correct"}, "action_id": "mark_correct", "style": "primary", "value": query_id},
+                            {"type": "button", "text": {"type": "plain_text", "text": "❌ Wrong"}, "action_id": "mark_wrong", "style": "danger", "value": query_id},
+                            {"type": "button", "text": {"type": "plain_text", "text": "📥 Download Excel"}, "action_id": "download_excel", "value": query_id},
+                            {"type": "button", "text": {"type": "plain_text", "text": "🔔 Subscribe"}, "action_id": "subscribe_alerts", "value": query_id}
+                        ]
+                    })
+                    say(blocks=blocks, text=chunks[0] if chunks else result_text)
+                else:
+                    say(result_text[:2900])
+            else:
+                say("✅ Thanks for the feedback! We'll review and improve this behavior.")
             return
 
         # Handle agent status intent
@@ -699,7 +937,7 @@ def run_main_logic(text, user_id, say):
             sql = ai_response.get("sql")
             explanation = ai_response.get("explanation", "Query executed")
             if sql:
-                result_text, query_id, df_masked = bot.execute_sql_query(sql, explanation)
+                result_text, query_id, df_masked = bot.execute_sql_query(sql, explanation, user_id=user_id, allow_personal_cache=True)
                 # If the user asked for agent active summary, augment the message
                 if (entities.get("flags") or {}).get("agent_active_summary"):
                     products = entities.get("products") or []
@@ -732,10 +970,31 @@ def run_main_logic(text, user_id, say):
                         result_text += "\n\n👥 Agent activity (quick check):\n" + "\n".join(summary_lines)
                 
                 if query_id:
-                    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": result_text}}, {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "📥 Download Excel"}, "action_id": "download_excel", "value": query_id}, {"type": "button", "text": {"type": "plain_text", "text": "🔔 Subscribe"}, "action_id": "subscribe_alerts", "value": query_id}]}]
-                    say(blocks=blocks, text=result_text)
+                    # Split long text into safe block-sized chunks
+                    def chunk_text(s: str, limit: int = 2500):
+                        parts = []
+                        while s:
+                            parts.append(s[:limit])
+                            s = s[limit:]
+                        return parts
+                    chunks = chunk_text(result_text)
+                    blocks = []
+                    for i, ch in enumerate(chunks):
+                        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": ch}})
+                    # Action buttons (include feedback buttons)
+                    blocks.append({
+                        "type": "actions",
+                        "elements": [
+                            {"type": "button", "text": {"type": "plain_text", "text": "✅ Correct"}, "action_id": "mark_correct", "style": "primary", "value": query_id},
+                            {"type": "button", "text": {"type": "plain_text", "text": "❌ Wrong"}, "action_id": "mark_wrong", "style": "danger", "value": query_id},
+                            {"type": "button", "text": {"type": "plain_text", "text": "📥 Download Excel"}, "action_id": "download_excel", "value": query_id},
+                            {"type": "button", "text": {"type": "plain_text", "text": "🔔 Subscribe"}, "action_id": "subscribe_alerts", "value": query_id}
+                        ]
+                    })
+                    say(blocks=blocks, text=chunks[0] if chunks else result_text)
                 else:
-                    say(result_text)
+                    # Fallback plain text if no query_id
+                    say(result_text[:2900])
             else:
                 say("❌ I couldn't generate a query for that request.")
         elif intent == "conversation":
@@ -790,11 +1049,8 @@ def handle_agent_mode(text: str, user_id: str, say):
         if is_summary:
             # Parse products if present, otherwise all
             products = ents.get("products") or []
-            wants_full = (agent_ai.get("scan") == "full") or ((ents.get("flags") or {}).get("agent_active_summary_full"))
-            pid_to_agents = (
-                bot.get_all_agent_ids_for_products(products)
-                if wants_full else bot.get_recent_agent_ids_for_products(products, limit_per_product=15)
-            )
+            # MODIFIED: Always fetch all agents, do not sample
+            pid_to_agents = bot.get_all_agent_ids_for_products(products)
             # Optional: specific agent codes or names requested
             explicit_codes = list(agent_ai.get("codes") or []) or bot.extract_agent_codes_from_text(text, products)
             requested_fields = list(agent_ai.get("fields") or []) or bot.parse_agent_fields(text)
@@ -862,9 +1118,17 @@ def handle_agent_mode(text: str, user_id: str, say):
         if not agent_name:
             say("Please provide the agent name or code (e.g., 'PW32306').")
             return
-        # Direct code support
+        # Direct code support or codes from AI
+        ai_codes = (ents.get("agent") or {}).get("codes") or []
         if re.fullmatch(r"[A-Za-z]{1,6}\d{2,8}", agent_name):
-            lead_agentid = agent_name
+            ai_codes = [agent_name]
+        if ai_codes:
+            # If multiple codes provided, ask to pick one
+            if len(ai_codes) > 1:
+                lines = [f"- `{c}`" for c in ai_codes]
+                say("Multiple agent codes provided. Please specify one:\n" + "\n".join(lines))
+                return
+            lead_agentid = ai_codes[0]
             candidate_label = None
         else:
             candidates = bot.resolve_agent_candidates(agent_name, products, limit=5)
@@ -942,7 +1206,8 @@ def handle_download_excel(ack, body, say):
         query_id = body["actions"][0]["value"]
         with open(f"query_results/{query_id}.json", "r") as f:
             payload = json.load(f)
-        df = pd.DataFrame(payload.get("data", []))
+        # Use unmasked data if available, otherwise fall back to masked (legacy)
+        df = pd.DataFrame(payload.get("data_unmasked") or payload.get("data", []))
         export_path = f"temp_exports/{query_id}.xlsx"
         os.makedirs("temp_exports", exist_ok=True)
         df.to_excel(export_path, index=False)
@@ -1000,6 +1265,166 @@ def handle_subscribe_alerts(ack, body, client):
     except Exception as e:
         print(f"Error opening subscription view: {e}")
 
+
+@app.action("show_menu")
+def handle_show_menu(ack, body, say):
+    """Handler for the 'show_menu' action button."""
+    ack()
+    user_id = body["user"]["id"]
+    show_main_menu(user_id, say)
+
+
+@app.action("show_help")
+def handle_show_help(ack, body, say):
+    """Show detailed help text for users."""
+    ack()
+    help_text = (
+        "• Metrics: ask for leads/bookings/revenue with products/time/dimensions.\n"
+        "• Agent: ask for 'agent status for <name>' or 'agents active now'.\n"
+        "• Type 'menu' to switch modes; 'end session' to reset."
+    )
+    say(help_text)
+
+@app.action("end_session")
+def handle_end_session(ack, body, say):
+    ack()
+    user_id = body.get("user", {}).get("id") or body.get("user", {}).get("user_id")
+    USER_SESSIONS.pop(user_id, None)
+    say("🛑 Session ended.")
+
+
+@app.action("download_schema")
+def handle_download_schema(ack, body, say):
+    ack()
+    try:
+        import csv
+        os.makedirs("temp_exports", exist_ok=True)
+        csv_path = os.path.join("temp_exports", "schema.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["column", "data_type", "is_categorical", "pii_level", "description"])
+            for col, meta in TABLE_SCHEMA.items():
+                writer.writerow([
+                    col,
+                    meta.get("data_type", ""),
+                    meta.get("is_categorical", False),
+                    meta.get("pii_level", "none"),
+                    meta.get("description", ""),
+                ])
+        app.client.files_upload_v2(
+            channel=body["channel"]["id"],
+            file=csv_path,
+            filename="schema.csv",
+            initial_comment="📚 Database schema",
+            thread_ts=body["message"]["ts"],
+        )
+        try:
+            os.remove(csv_path)
+        except Exception:
+            pass
+    except Exception as e:
+        say(text=f"❌ Failed to download schema: {e}", thread_ts=body.get("message", {}).get("ts"))
+
+
+# Action: Mark result as Correct (store per-user cache and notify experts)
+@app.action("mark_correct")
+def handle_mark_correct(ack, body, say):
+    ack()
+    try:
+        user_id = body.get("user", {}).get("id") or body.get("user", {}).get("user_id")
+        query_id = body["actions"][0]["value"]
+        # Load result context to cache per-user
+        with open(f"query_results/{query_id}.json", "r") as f:
+            payload = json.load(f)
+        result_text = "Cached personal result"
+        # Persist in per-user cache
+        USER_QUERY_CACHE.setdefault(user_id, {})[query_id] = {
+            "data": payload.get("data", []),
+            "sql": payload.get("sql"),
+            "explanation": payload.get("explanation"),
+            "result_text": None,  # full text is regenerated as needed
+            "created_at": time.time(),
+        }
+        say(text="✅ Marked as correct. I will reuse this result for you if you ask the same thing again.", thread_ts=body.get("message", {}).get("ts"))
+        # Notify experts for potential approval for global logic
+        try:
+            feedback_id = business_logic_manager.store_feedback(
+                user_id=user_id,
+                original_query=body.get("message", {}).get("text", ""),
+                feedback_text=f"User marked query `{query_id}` as correct. Consider approving logic for broader use.",
+                context={"query_id": query_id, "sql": payload.get("sql"), "explanation": payload.get("explanation")},
+            )
+            if feedback_id:
+                send_feedback_to_channel(
+                    feedback_id,
+                    user_id,
+                    body.get("message", {}).get("text", ""),
+                    {},
+                    context={"query_id": query_id, "sql": payload.get("sql"), "explanation": payload.get("explanation")},
+                )
+        except Exception:
+            pass
+    except Exception as e:
+        say(text=f"❌ Could not mark as correct: {e}", thread_ts=body.get("message", {}).get("ts"))
+
+
+# Action: Mark result as Wrong (collect feedback and notify experts)
+@app.action("mark_wrong")
+def handle_mark_wrong(ack, body, client, say):
+    ack()
+    try:
+        user_id = body.get("user", {}).get("id") or body.get("user", {}).get("user_id")
+        query_id = body["actions"][0]["value"]
+        # Open a modal to capture what went wrong
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": "submit_wrong_feedback",
+                "title": {"type": "plain_text", "text": "What was wrong?"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "wrong_reason_block",
+                        "element": {"type": "plain_text_input", "action_id": "wrong_reason", "multiline": True},
+                        "label": {"type": "plain_text", "text": "Please describe the issue"},
+                    }
+                ],
+                "private_metadata": json.dumps({"query_id": query_id, "channel_id": body["channel"]["id"]}),
+            },
+        )
+    except Exception as e:
+        say(text=f"❌ Could not open feedback form: {e}", thread_ts=body.get("message", {}).get("ts"))
+
+
+@app.view("submit_wrong_feedback")
+def handle_wrong_feedback_submission(ack, body, say):
+    ack()
+    user_id = body["user"]["id"]
+    try:
+        metadata = json.loads(body["view"]["private_metadata"])
+        query_id = metadata["query_id"]
+        channel_id = metadata["channel_id"]
+        reason = body["view"]["state"]["values"]["wrong_reason_block"]["wrong_reason"]["value"]
+        # Store feedback and notify experts
+        feedback_id = business_logic_manager.store_feedback(
+            user_id=user_id,
+            original_query=f"Query ID: {query_id}",
+            feedback_text=reason or "User marked result as wrong",
+            context={"query_id": query_id, "reason": reason},
+        )
+        if feedback_id:
+            send_feedback_to_channel(
+                feedback_id,
+                user_id,
+                f"Query marked wrong: {query_id}",
+                {},
+                context={"query_id": query_id, "reason": reason},
+            )
+        say(channel=channel_id, text="✅ Thanks for the feedback. Our experts will review it.")
+    except Exception as e:
+        say(text=f"❌ Error submitting feedback: {e}")
 
 @app.view("submit_subscription")
 def handle_subscription_submission(ack, body, say):
@@ -1060,23 +1485,6 @@ def handle_choose_agent_status(ack, body, say):
     user_id = body.get("user", {}).get("id") or body.get("user", {}).get("user_id")
     USER_SESSIONS[user_id] = {"mode": "agent"}
     say("✅ Agent mode selected. Ask 'agent status for <name>' or 'agents active now'. Type 'menu' anytime to switch.")
-
-@app.action("show_help")
-def handle_show_help(ack, body, say):
-    ack()
-    help_text = (
-        "• Metrics: ask for leads/bookings/revenue with products/time/dimensions.\n"
-        "• Agent: ask for 'agent status for <name>' or 'agents active now'.\n"
-        "• Type 'menu' to switch modes; 'end session' to reset."
-    )
-    say(help_text)
-
-@app.action("end_session")
-def handle_end_session(ack, body, say):
-    ack()
-    user_id = body.get("user", {}).get("id") or body.get("user", {}).get("user_id")
-    USER_SESSIONS.pop(user_id, None)
-    say("🛑 Session ended.")
 
 if __name__ == "__main__":
     print("🚀 Starting Simplified ThinkTank Bot...")

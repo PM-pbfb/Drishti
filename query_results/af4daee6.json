@@ -1,0 +1,1 @@
+{"data": [{"leads": 328}], "sql": "SELECT COUNT(*) as leads FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (13) AND DATE(leaddate) = CURRENT_DATE - INTERVAL '1' DAY", "explanation": "Metric: leads; Products: [13]; Time: yesterday"}

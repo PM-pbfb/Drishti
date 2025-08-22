@@ -133,7 +133,7 @@ class DistinctCache:
 distinct_cache = DistinctCache(
     ttl_seconds=2592000,  # 30 days
     limit=100,
-    max_columns=6,
-    columns_whitelist=['mkt_category', 'leadcreationsource', 'booking_status', 'insurername', 'insurerfullname']
+    max_columns=10,
+    columns_whitelist=['mkt_category', 'leadcreationsource', 'booking_status', 'insurername', 'insurerfullname', 'booking_occupancy', 'lead_occupancy']
 )
 

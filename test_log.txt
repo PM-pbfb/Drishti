@@ -1,0 +1,360 @@
+✅ PASS | Required File: main.py
+   Details: File main.py: Exists
+
+✅ PASS | Required File: config.py
+   Details: File config.py: Exists
+
+✅ PASS | Required File: database.py
+   Details: File database.py: Exists
+
+✅ PASS | Required File: subscription_manager.py
+   Details: File subscription_manager.py: Exists
+
+✅ PASS | Required File: business_logic_manager.py
+   Details: File business_logic_manager.py: Exists
+
+✅ PASS | Required Directory: query_results
+   Details: Directory query_results: Exists
+
+✅ PASS | Required Directory: temp_exports
+   Details: Directory temp_exports: Exists
+
+✅ PASS | Environment Variable: SLACK_BOT_TOKEN
+   Details: Environment variable SLACK_BOT_TOKEN: Set
+
+✅ PASS | Environment Variable: SLACK_SIGNING_SECRET
+   Details: Environment variable SLACK_SIGNING_SECRET: Set
+
+✅ PASS | Environment Variable: SLACK_APP_TOKEN
+   Details: Environment variable SLACK_APP_TOKEN: Set
+
+✅ PASS | Environment Variable: GOOGLE_API_KEY
+   Details: Environment variable GOOGLE_API_KEY: Set
+
+✅ PASS | Environment Variable: PRESTO_CONNECTION
+   Details: Environment variable PRESTO_CONNECTION: Set
+
+✅ PASS | Environment Variable: FEEDBACK_CHANNEL_ID
+   Details: Environment variable FEEDBACK_CHANNEL_ID: Set
+
+✅ PASS | Product Mappings Count
+   Details: Found 124 product mappings
+
+✅ PASS | Product Mapping: ghi
+   Details: Expected ghi -> 1, Got: 1
+
+✅ PASS | Product Mapping: fire
+   Details: Expected fire -> 5, Got: 5
+
+✅ PASS | Product Mapping: marine
+   Details: Expected marine -> 13, Got: 13
+
+✅ PASS | Product Mapping: wc
+   Details: Expected wc -> 19, Got: 19
+
+✅ PASS | Required File: main.py
+   Details: File main.py: Exists
+
+✅ PASS | Required File: config.py
+   Details: File config.py: Exists
+
+✅ PASS | Required File: database.py
+   Details: File database.py: Exists
+
+✅ PASS | Required File: subscription_manager.py
+   Details: File subscription_manager.py: Exists
+
+✅ PASS | Required File: business_logic_manager.py
+   Details: File business_logic_manager.py: Exists
+
+✅ PASS | Required Directory: query_results
+   Details: Directory query_results: Exists
+
+✅ PASS | Required Directory: temp_exports
+   Details: Directory temp_exports: Exists
+
+✅ PASS | Environment Variable: SLACK_BOT_TOKEN
+   Details: Environment variable SLACK_BOT_TOKEN: Set
+
+✅ PASS | Environment Variable: SLACK_SIGNING_SECRET
+   Details: Environment variable SLACK_SIGNING_SECRET: Set
+
+✅ PASS | Environment Variable: SLACK_APP_TOKEN
+   Details: Environment variable SLACK_APP_TOKEN: Set
+
+✅ PASS | Environment Variable: GOOGLE_API_KEY
+   Details: Environment variable GOOGLE_API_KEY: Set
+
+✅ PASS | Environment Variable: PRESTO_CONNECTION
+   Details: Environment variable PRESTO_CONNECTION: Set
+
+✅ PASS | Environment Variable: FEEDBACK_CHANNEL_ID
+   Details: Environment variable FEEDBACK_CHANNEL_ID: Set
+
+✅ PASS | Product Mappings Count
+   Details: Found 124 product mappings
+
+✅ PASS | Product Mapping: ghi
+   Details: Expected ghi -> 1, Got: 1
+
+✅ PASS | Product Mapping: fire
+   Details: Expected fire -> 5, Got: 5
+
+✅ PASS | Product Mapping: marine
+   Details: Expected marine -> 13, Got: 13
+
+✅ PASS | Product Mapping: wc
+   Details: Expected wc -> 19, Got: 19
+
+❌ FAIL | Product Detection: 'number of leads in ghi'
+   Details: Expected: [1], Got: [] | GHI should be detected as Group Health Insurance
+
+✅ PASS | Product Detection: 'fire insurance bookings'
+   Details: Expected: [5], Got: [5] | Fire insurance should be detected
+
+✅ PASS | Product Detection: 'marine leads'
+   Details: Expected: [13], Got: [13] | Marine should be detected
+
+❌ FAIL | Product Detection: 'wc bookings'
+   Details: Expected: [19], Got: [] | WC should be detected as Workmen Compensation
+
+✅ PASS | Product Detection: 'fire and marine bookings'
+   Details: Expected: [5, 13], Got: [5, 13] | Multiple products should be detected
+
+❌ FAIL | Product Detection: 'ghi wc fire'
+   Details: Expected: [1, 5, 19], Got: [5] | Three products should be detected
+
+✅ PASS | Product Detection: 'number of leads in dws'
+   Details: Expected: [], Got: [] | Non-existent product should return empty
+
+✅ PASS | Product Detection: 'xyz bookings'
+   Details: Expected: [], Got: [] | Non-existent product should return empty
+
+✅ PASS | Product Detection: 'rest insurance'
+   Details: Expected: [], Got: [] | Non-existent product should return empty
+
+✅ PASS | Time Pattern: today
+   Details: Time pattern for 'today': DATE(leaddate) = CURRENT_DATE
+
+✅ PASS | Time Pattern: yesterday
+   Details: Time pattern for 'yesterday': DATE(leaddate) = CURRENT_DATE - INTERVAL '1' DAY
+
+✅ PASS | Time Pattern: this week
+   Details: Time pattern for 'this week': leaddate >= DATE_TRUNC('week', CURRENT_DATE)
+
+✅ PASS | Time Pattern: last week
+   Details: Time pattern for 'last week': leaddate >= DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7' DAY AND leaddate < DATE_TRUNC('week', CURRENT_DATE)
+
+✅ PASS | Time Pattern: this month
+   Details: Time pattern for 'this month': leaddate >= DATE_TRUNC('month', CURRENT_DATE)
+
+✅ PASS | Time Pattern: last month
+   Details: Time pattern for 'last month': leaddate >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1' MONTH AND leaddate < DATE_TRUNC('month', CURRENT_DATE)
+
+✅ PASS | SQL Pattern: leads
+   Details: SQL pattern for 'leads': COUNT(*) as leads
+
+✅ PASS | SQL Pattern: bookings
+   Details: SQL pattern for 'bookings': COUNT(CASE WHEN booking_status='IssuedBusiness' THEN 1 END) as bookings
+
+✅ PASS | SQL Pattern: revenue
+   Details: SQL pattern for 'revenue': SUM(revenue) as total_revenue
+
+✅ PASS | SQL Pattern: premium
+   Details: SQL pattern for 'premium': SUM(premium) as total_premium
+
+✅ PASS | SQL Pattern: brokerage
+   Details: SQL pattern for 'brokerage': SUM(brokerage) as total_brokerage
+
+✅ PASS | SQL Pattern: conversion_rate
+   Details: SQL pattern for 'conversion_rate': (COUNT(CASE WHEN booking_status='IssuedBusiness' THEN 1 END) * 100.0 / COUNT(*)) as conversion_rate
+
+✅ PASS | SQL Pattern: avg_premium
+   Details: SQL pattern for 'avg_premium': AVG(premium) as avg_premium
+
+✅ PASS | SQL Pattern: sum_insured
+   Details: SQL pattern for 'sum_insured': SUM(suminsured) as total_sum_insured
+
+✅ PASS | SQL Pattern: lives_covered
+   Details: SQL pattern for 'lives_covered': SUM(totalnooflives) as total_lives
+
+✅ PASS | Add Subscription
+   Details: Added subscription with ID: 1754999046
+
+✅ PASS | Get User Subscriptions
+   Details: Found 1 subscriptions for user
+
+✅ PASS | Remove Subscription
+   Details: Removed subscription 1754999046: True
+
+✅ PASS | Store Feedback
+   Details: Stored feedback with ID: 1754999046
+
+✅ PASS | Update Feedback Status
+   Details: Updated feedback 1754999046 to approved: True
+
+✅ PASS | Get Approved Logic
+   Details: Retrieved 1 approved logic entries
+
+✅ PASS | Database Instance Creation
+   Details: Database instance created successfully
+
+✅ PASS | Masking PII Data
+   Details: Original Names: ['John Doe', 'Jane Smith'], Masked Names: ['Barbara Hobbs', 'Taylor Jackson']
+
+✅ PASS | Retaining Non-PII Data
+   Details: Premium column should not be masked
+
+✅ PASS | Required File: main.py
+   Details: File main.py: Exists
+
+✅ PASS | Required File: config.py
+   Details: File config.py: Exists
+
+✅ PASS | Required File: database.py
+   Details: File database.py: Exists
+
+✅ PASS | Required File: subscription_manager.py
+   Details: File subscription_manager.py: Exists
+
+✅ PASS | Required File: business_logic_manager.py
+   Details: File business_logic_manager.py: Exists
+
+✅ PASS | Required Directory: query_results
+   Details: Directory query_results: Exists
+
+✅ PASS | Required Directory: temp_exports
+   Details: Directory temp_exports: Exists
+
+✅ PASS | Environment Variable: SLACK_BOT_TOKEN
+   Details: Environment variable SLACK_BOT_TOKEN: Set
+
+✅ PASS | Environment Variable: SLACK_SIGNING_SECRET
+   Details: Environment variable SLACK_SIGNING_SECRET: Set
+
+✅ PASS | Environment Variable: SLACK_APP_TOKEN
+   Details: Environment variable SLACK_APP_TOKEN: Set
+
+✅ PASS | Environment Variable: GOOGLE_API_KEY
+   Details: Environment variable GOOGLE_API_KEY: Set
+
+✅ PASS | Environment Variable: PRESTO_CONNECTION
+   Details: Environment variable PRESTO_CONNECTION: Set
+
+✅ PASS | Environment Variable: FEEDBACK_CHANNEL_ID
+   Details: Environment variable FEEDBACK_CHANNEL_ID: Set
+
+✅ PASS | Product Mappings Count
+   Details: Found 124 product mappings
+
+✅ PASS | Product Mapping: ghi
+   Details: Expected ghi -> 1, Got: 1
+
+✅ PASS | Product Mapping: fire
+   Details: Expected fire -> 5, Got: 5
+
+✅ PASS | Product Mapping: marine
+   Details: Expected marine -> 13, Got: 13
+
+✅ PASS | Product Mapping: wc
+   Details: Expected wc -> 19, Got: 19
+
+❌ FAIL | Product Detection: 'number of leads in ghi'
+   Details: Expected: [1], Got: [] | GHI should be detected as Group Health Insurance
+
+❌ FAIL | Product Detection: 'fire insurance bookings'
+   Details: Expected: [5], Got: [] | Fire insurance should be detected
+
+❌ FAIL | Product Detection: 'marine leads'
+   Details: Expected: [13], Got: [] | Marine should be detected
+
+❌ FAIL | Product Detection: 'wc bookings'
+   Details: Expected: [19], Got: [] | WC should be detected as Workmen Compensation
+
+❌ FAIL | Product Detection: 'fire and marine bookings'
+   Details: Expected: [5, 13], Got: [] | Multiple products should be detected
+
+❌ FAIL | Product Detection: 'ghi wc fire'
+   Details: Expected: [1, 5, 19], Got: [] | Three products should be detected
+
+✅ PASS | Product Detection: 'number of leads in dws'
+   Details: Expected: [], Got: [] | Non-existent product should return empty
+
+✅ PASS | Product Detection: 'xyz bookings'
+   Details: Expected: [], Got: [] | Non-existent product should return empty
+
+✅ PASS | Product Detection: 'rest insurance'
+   Details: Expected: [], Got: [] | Non-existent product should return empty
+
+✅ PASS | Time Pattern: today
+   Details: Time pattern for 'today': DATE(leaddate) = CURRENT_DATE
+
+✅ PASS | Time Pattern: yesterday
+   Details: Time pattern for 'yesterday': DATE(leaddate) = CURRENT_DATE - INTERVAL '1' DAY
+
+✅ PASS | Time Pattern: this week
+   Details: Time pattern for 'this week': leaddate >= DATE_TRUNC('week', CURRENT_DATE)
+
+✅ PASS | Time Pattern: last week
+   Details: Time pattern for 'last week': leaddate >= DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7' DAY AND leaddate < DATE_TRUNC('week', CURRENT_DATE)
+
+✅ PASS | Time Pattern: this month
+   Details: Time pattern for 'this month': leaddate >= DATE_TRUNC('month', CURRENT_DATE)
+
+✅ PASS | Time Pattern: last month
+   Details: Time pattern for 'last month': leaddate >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1' MONTH AND leaddate < DATE_TRUNC('month', CURRENT_DATE)
+
+✅ PASS | SQL Pattern: leads
+   Details: SQL pattern for 'leads': COUNT(*) as leads
+
+✅ PASS | SQL Pattern: bookings
+   Details: SQL pattern for 'bookings': COUNT(CASE WHEN booking_status='IssuedBusiness' THEN 1 END) as bookings
+
+✅ PASS | SQL Pattern: revenue
+   Details: SQL pattern for 'revenue': SUM(revenue) as total_revenue
+
+✅ PASS | SQL Pattern: premium
+   Details: SQL pattern for 'premium': SUM(premium) as total_premium
+
+✅ PASS | SQL Pattern: brokerage
+   Details: SQL pattern for 'brokerage': SUM(brokerage) as total_brokerage
+
+✅ PASS | SQL Pattern: conversion_rate
+   Details: SQL pattern for 'conversion_rate': (COUNT(CASE WHEN booking_status='IssuedBusiness' THEN 1 END) * 100.0 / COUNT(*)) as conversion_rate
+
+✅ PASS | SQL Pattern: avg_premium
+   Details: SQL pattern for 'avg_premium': AVG(premium) as avg_premium
+
+✅ PASS | SQL Pattern: sum_insured
+   Details: SQL pattern for 'sum_insured': SUM(suminsured) as total_sum_insured
+
+✅ PASS | SQL Pattern: lives_covered
+   Details: SQL pattern for 'lives_covered': SUM(totalnooflives) as total_lives
+
+✅ PASS | Add Subscription
+   Details: Added subscription with ID: 1754999220
+
+✅ PASS | Get User Subscriptions
+   Details: Found 1 subscriptions for user
+
+✅ PASS | Remove Subscription
+   Details: Removed subscription 1754999220: True
+
+✅ PASS | Store Feedback
+   Details: Stored feedback with ID: 1754999220
+
+✅ PASS | Update Feedback Status
+   Details: Updated feedback 1754999220 to approved: True
+
+✅ PASS | Get Approved Logic
+   Details: Retrieved 2 approved logic entries
+
+✅ PASS | Database Instance Creation
+   Details: Database instance created successfully
+
+✅ PASS | Masking PII Data
+   Details: Original Names: ['John Doe', 'Jane Smith'], Masked Names: ['Jamie Alvarez', 'Danielle Lopez']
+
+✅ PASS | Retaining Non-PII Data
+   Details: Premium column should not be masked
+

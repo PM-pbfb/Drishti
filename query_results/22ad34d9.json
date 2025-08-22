@@ -1,0 +1,1 @@
+{"data": [{"leads": 95888}], "sql": "SELECT COUNT(*) as leads FROM sme_analytics.sme_leadbookingrevenue WHERE paymentstatus = 300", "explanation": "Metric: leads; Time: null; Online payments only (paymentstatus=300)"}

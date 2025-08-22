@@ -151,7 +151,9 @@ def build_sql(entities: Dict[str, Any]) -> Dict[str, str]:
             bucket_expr = f"DATE_TRUNC('week', {date_column})"
             bucket_alias = "week"
         # Prepend bucket to SELECT and add to group by
-        select_parts = [f"{bucket_expr} AS {bucket_alias}"] + select_parts
+        # Avoid duplicate bucket if user already explicitly requested 'month' dimension
+        if all(part.find(" AS month") == -1 for part in select_parts):
+            select_parts = [f"{bucket_expr} AS {bucket_alias}"] + select_parts
         if bucket_expr not in group_by:
             group_by.append(bucket_expr)
 
