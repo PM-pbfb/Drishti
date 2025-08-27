@@ -1,0 +1,1 @@
+{"data_unmasked": [{"total_premium": 113838422.03}], "data": [{"total_premium": 113838422.03}], "sql": "SELECT SUM(premium) as total_premium FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (5) AND DATE(leaddate) >= DATE '2025-01-01' AND DATE(leaddate) <= DATE '2025-12-31'", "explanation": "Metric: premium; Products: [5]"}

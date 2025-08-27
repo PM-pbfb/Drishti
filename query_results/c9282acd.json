@@ -1,1 +1,0 @@
-{"data": [{"leads": 353576}], "sql": "SELECT COUNT(*) as leads FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (13)", "explanation": "Metric: leads; Products: [13]"}

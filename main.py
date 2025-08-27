@@ -17,6 +17,11 @@ from datetime import datetime
 import re
 import requests
 from rapidfuzz import fuzz, process
+from typing import Dict, Any
+import threading
+from flask import Flask, request, jsonify, send_file
+from slack_sdk import WebClient
+from flask_cors import CORS
 
 # Import configurations
 from config import *
@@ -38,13 +43,13 @@ model = initialize_gemini()
 
 # Database connection
 from database import SimpleDatabase
-db_manager = SimpleDatabase(os.getenv("PRESTO_CONNECTION"))
 from subscription_manager import subscription_manager
-from business_logic_manager import business_logic_manager
+from business_logic_manager import BusinessLogicManager
 from masking_service import masking_service
 from nlp_extractor import nlp_extractor
 from sql_builder import build_sql
 from distinct_cache import distinct_cache
+from intent_classifier import classify_intent
 
 # Simple in-memory session store for per-user mode
 USER_SESSIONS = {}
@@ -363,6 +368,8 @@ class SimplifiedBot:
 
             # 2) Fuzzy score against the pool
             query_norm = " ".join(str(agent_name).lower().split())
+            is_single_word_query = len(query_norm.split()) == 1
+
             def trigrams(s: str) -> set:
                 s2 = s.replace(" ", "").lower()
                 return {s2[i:i+3] for i in range(len(s2)-2)} if len(s2) >= 3 else set()
@@ -370,6 +377,11 @@ class SimplifiedBot:
             scored = []
             for nm in all_names:
                 nm_norm = " ".join(nm.lower().split())
+                
+                # ADDED: Stricter check for single-name queries
+                if is_single_word_query and query_norm not in nm_norm:
+                    continue
+
                 score = max(fuzz.WRatio(query_norm, nm_norm), fuzz.token_set_ratio(query_norm, nm_norm))
                 if len(query_norm) >= 5 and nm_norm[:1] != query_norm[:1]:
                     if not (q_tris and (q_tris & trigrams(nm_norm))):
@@ -589,24 +601,35 @@ class SimplifiedBot:
         return want
 
     def get_all_agent_ids_for_products(self, products):
-        """Return dict product_id -> all distinct lead_agentid values (no sampling). Potentially slow."""
+        """
+        Return dict product_id -> all distinct lead_agentid values.
+        MODIFIED: Fetches only agents with bookings in the current or previous month.
+        """
         results = {}
         try:
+            # Common WHERE clause for active agents based on recent bookings
+            active_agent_filter = (
+                "lead_agentid IS NOT NULL AND TRIM(lead_agentid) <> '' "
+                "AND booking_status = 'IssuedBusiness' "
+                "AND bookingdate >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1' MONTH"
+            )
+
             if not products:
                 sql = (
                     "SELECT DISTINCT lead_agentid FROM sme_analytics.sme_leadbookingrevenue "
-                    "WHERE lead_agentid IS NOT NULL AND TRIM(lead_agentid) <> ''"
+                    f"WHERE {active_agent_filter}"
                 )
-                print("DEBUG: Fetching ALL agent codes (no product filter)")
+                print("DEBUG: Fetching ACTIVE agent codes (this/last month bookings, no product filter)")
                 df = self.db.run_query(sql, use_cache=False)
                 results[None] = [str(x) for x in df.iloc[:, 0].tolist() if str(x).strip()]
                 return results
+
             for pid in products:
                 sql = (
                     "SELECT DISTINCT lead_agentid FROM sme_analytics.sme_leadbookingrevenue "
-                    f"WHERE investmenttypeid = {int(pid)} AND lead_agentid IS NOT NULL AND TRIM(lead_agentid) <> ''"
+                    f"WHERE investmenttypeid = {int(pid)} AND {active_agent_filter}"
                 )
-                print(f"DEBUG: Fetching ALL agent codes for product {pid}")
+                print(f"DEBUG: Fetching ACTIVE agent codes for product {pid}")
                 df = self.db.run_query(sql, use_cache=False)
                 results[int(pid)] = [str(x) for x in df.iloc[:, 0].tolist() if str(x).strip()]
         except Exception as e:
@@ -678,7 +701,13 @@ class SimplifiedBot:
             return "\n**Categorical Values**:\n" + "\n".join(context_parts)
         return ""
 
+# Globals
+db_manager = SimpleDatabase(os.getenv("PRESTO_CONNECTION"))
 bot = SimplifiedBot(db_manager)
+subscription_manager = subscription_manager
+business_logic_manager = BusinessLogicManager()
+USER_SESSIONS: Dict[str, Dict[str, Any]] = {}
+USER_QUERY_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def looks_like_feedback(message: str) -> bool:
@@ -750,268 +779,61 @@ def send_feedback_to_channel(feedback_id: int, user_id: str, original_text: str,
     except Exception as e:
         print(f"Failed to post feedback to channel: {e}")
 
-def run_main_logic(text, user_id, say):
+def run_main_logic(text: str, user_id: str, say):
+    """Main logic router: classifies intent and routes to the correct handler."""
     try:
-        # If user requests main menu/reset within a session
-        lower_text = (text or "").strip().lower()
-        if lower_text in ("menu", "main menu", "start over", "restart", "end session"):
-            if lower_text in ("end session",):
-                USER_SESSIONS.pop(user_id, None)
-                say("✅ Session ended.")
-                debug(f"User {user_id} ended session")
-            show_main_menu(user_id, say)
-            return
+        # 1. Classify the intent of the query
+        intent = classify_intent(text)
 
-        # QUICK SCHEMA REQUESTS IN METRICS FLOW
-        if any(k in lower_text for k in ["show schema", "schema", "database schema", "table schema", "columns list", "list columns"]):
-            send_schema(say)
-            return
-
-        # Route by chosen session mode first (two distinct workflows)
-        mode = (USER_SESSIONS.get(user_id) or {}).get("mode")
-        # Hard route: if the user asks about agent activity, go to agent mode handler regardless
-        if mode == "agent" or any(k in lower_text for k in ["agents active", "active agents", "agents online", "how many agents"]):
-            debug(f"Routing to agent mode (mode={mode}) for user {user_id}")
-            return handle_agent_mode(text, user_id, say)
-
-        # Default/metrics workflow (legacy behavior + clarifications/feedback)
-        entities = bot.process_query_with_ai(text)
-        debug(f"Entities extracted: {entities}")
-
-        # Confidence-based clarification for products
-        if entities.get("intent") == "metric_query" and entities.get("confidence", 0) < 0.6:
-            say("🤔 I might be unsure about your request. Could you specify the product or metric?")
-            return
-
-        # Shortcut: treat suggestions/instructions as feedback even if extractor says clarification
-        if entities.get("intent") == "feedback" or looks_like_feedback(text):
-            # 1) Store feedback and notify experts
-            try:
-                feedback_id = business_logic_manager.store_feedback(
-                    user_id=user_id,
-                    original_query=text,
-                    feedback_text="User correction/suggestion",
-                    context={"entities": entities},
-                )
+        if intent == 'business_logic':
+            debug(f"Routing to BusinessLogicManager for user {user_id}")
+            say("🧠 This seems like a complex query. Let me think...")
+            result = business_logic_manager.generate_sql_from_logic(text)
+            if "error" in result or "sql" not in result:
+                say(f"❌ I had trouble understanding that logic. Error: {result.get('error', 'Unknown')}")
+                return
+            # Always execute the SQL if present
+            sql_query = result.get("sql")
+            explanation = result.get("explanation")
+            result_text, query_id, df = bot.execute_sql_query(sql_query, explanation, user_id)
+            say(result_text)
+            # Ask to save the logic (optional)
+            if df is not None and not df.empty:
+                pass  # TODO: Implement a block kit action to ask user to save
+        else: # Handle simple_metric and other intents
+            debug(f"Routing to standard logic for user {user_id}")
+            entities = nlp_extractor.extract(text)
+            sql_payload = build_sql(entities)
+            if sql_payload.get("intent") != "metric_query":
+                say("I'm sorry, I'm not sure how to handle that request.")
+                return
+            sql_query = sql_payload.get("sql")
+            explanation = sql_payload.get("explanation")
+            result_text, query_id, df = bot.execute_sql_query(sql_query, explanation, user_id)
+            say(result_text)
+        # After any query, check for embedded feedback
+        feedback_keywords = ["for future understand", "remember that", "the logic should be", "for future reference"]
+        text_lower = text.lower()
+        for keyword in feedback_keywords:
+            if keyword in text_lower:
+                feedback_text = text.split(keyword, 1)[1].strip()
+                if feedback_text:
+                    say(f"📝 Noted for expert review:\n> _{feedback_text}_")
+                    feedback_id = business_logic_manager.store_feedback(
+                        user_id=user_id,
+                        original_query=text,
+                        feedback_text=feedback_text,
+                        context={"query_id": query_id, "sql": sql_query, "explanation": explanation}
+                    )
                 if feedback_id:
-                    send_feedback_to_channel(feedback_id, user_id, text, entities)
-            except Exception:
-                pass
-            
-            # 2) Attempt to parse corrective entities from the feedback and rerun query immediately
-            try:
-                correction_entities = bot.process_query_with_ai(text)
-            except Exception:
-                correction_entities = {}
-            # Merge with prior entities to preserve context
-            corrected = merge_entities_for_correction(entities, correction_entities, text)
-            # Build SQL with corrected entities
-            sql_payload = build_sql(corrected or {})
-            if sql_payload.get("intent") == "metric_query" and sql_payload.get("sql"):
-                result_text, query_id, df_masked = bot.execute_sql_query(sql_payload["sql"], sql_payload.get("explanation", "Query executed"), user_id=user_id, allow_personal_cache=False)
-                if query_id:
-                    # Show same action buttons including feedback buttons
-                    def chunk_text(s: str, limit: int = 2500):
-                        parts = []
-                        while s:
-                            parts.append(s[:limit])
-                            s = s[limit:]
-                        return parts
-                    chunks = chunk_text(result_text)
-                    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": ch}} for ch in chunks]
-                    blocks.append({
-                        "type": "actions",
-                        "elements": [
-                            {"type": "button", "text": {"type": "plain_text", "text": "✅ Correct"}, "action_id": "mark_correct", "style": "primary", "value": query_id},
-                            {"type": "button", "text": {"type": "plain_text", "text": "❌ Wrong"}, "action_id": "mark_wrong", "style": "danger", "value": query_id},
-                            {"type": "button", "text": {"type": "plain_text", "text": "📥 Download Excel"}, "action_id": "download_excel", "value": query_id},
-                            {"type": "button", "text": {"type": "plain_text", "text": "🔔 Subscribe"}, "action_id": "subscribe_alerts", "value": query_id}
-                        ]
-                    })
-                    say(blocks=blocks, text=chunks[0] if chunks else result_text)
-                else:
-                    say(result_text[:2900])
-            else:
-                say("✅ Thanks for the feedback! We'll review and improve this behavior.")
-            return
-
-        # Handle agent status intent
-        if entities.get("intent") == "agent_status":
-            agent_name = ((entities.get("agent") or {}).get("name")) or None
-            if not agent_name:
-                # Try AI-assisted extraction
-                agent_name = bot.ai_assisted_agent_name(text)
-            if agent_name:
-                # Remove trailing "in <something>" fragments and standalone time tokens misparsed as name
-                agent_name = re.sub(r"\bin\s+[A-Za-z\s]+$", "", agent_name, flags=re.IGNORECASE).strip()
-                if agent_name.lower() in ("today", "yesterday", "this week", "this month"):
-                    agent_name = None
-            products = entities.get("products") or []
-            if not agent_name:
-                say("Please specify the agent name, e.g., 'agent status for Sahil Sharma'.")
-                return
-            # If user provided an agent code directly, use it
-            if re.fullmatch(r"[A-Za-z]{1,6}\d{2,8}", agent_name):
-                lead_agentid = agent_name
-                candidate_label = None
-            else:
-                candidates = bot.resolve_agent_candidates(agent_name, products, limit=5)
-                if not candidates:
-                    suggestions = bot.suggest_agent_names(agent_name)
-                    if suggestions:
-                        suggest_text = ", ".join(suggestions)
-                        say(f"Couldn't find any agent for '{agent_name}'. Did you mean: {suggest_text}?")
-                    else:
-                        say(f"Couldn't find any agent for '{agent_name}'. Try the exact name used in CRM or provide agent code.")
-                    return
-                if len(candidates) > 1:
-                    lines = [f"- {c['name'] or 'Unknown'} (code: `{c['code']}`)" for c in candidates]
-                    say("Multiple agents match that name. Please specify the agent code from below:\n" + "\n".join(lines))
-                    return
-                lead_agentid = candidates[0]["code"]
-                candidate_label = candidates[0].get("name")
-
-            status_list = bot.fetch_agent_status(lead_agentid)
-            if not status_list:
-                label = candidate_label or agent_name
-                say(f"No live status found for agent '{label}' (ID: {lead_agentid}).")
-                return
-            s = status_list[0]
-            # Build a concise Slack message
-            fields = []
-            def add_field(title, key):
-                if s.get(key) is not None and s.get(key) != "":
-                    fields.append({"type": "mrkdwn", "text": f"*{title}:* {s.get(key)}"})
-            add_field("Agent", "AgentName")
-            add_field("Code", "AgentCode")
-            add_field("Status", "Status")
-            add_field("Last Updated", "LastUpdatedOn")
-            add_field("On WFH", "IsWFH")
-            add_field("Company", "CallingCompany")
-            add_field("Total Calls", "TotalCalls")
-            add_field("Connected", "ConnectedDials")
-            add_field("Talk Time (s)", "TotalTalkTime")
-            detail_block = {"type": "section", "fields": fields[:10]} if fields else {"type": "section", "text": {"type": "mrkdwn", "text": "No additional details available."}}
-            blocks = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"🔎 Agent live status for *{agent_name}* (ID: `{lead_agentid}`)"}},
-                detail_block,
-            ]
-            say(blocks=blocks, text=f"Agent status for {agent_name}")
-            return
-
-        ai_response = bot.generate_response(text, user_id, product_ids=entities)
-        intent = ai_response.get("intent")
-        
-        if intent == "metric_query":
-            # If the user primarily asked for agent active summary (and no explicit metric), serve that directly
-            wants_agent_summary = (entities.get("flags") or {}).get("agent_active_summary")
-            wants_full = (entities.get("flags") or {}).get("agent_active_summary_full")
-            explicit_metric = ai_response.get("sql") and (entities.get("metric") or entities.get("metrics"))
-            if wants_agent_summary and not explicit_metric:
-                products = entities.get("products") or []
-                if wants_full:
-                    print("DEBUG: Running FULL agent activity scan")
-                    pid_to_agents = bot.get_all_agent_ids_for_products(products)
-                else:
-                    pid_to_agents = bot.get_recent_agent_ids_for_products(products, limit_per_product=15)
-                summary_lines = []
-                for pid, agent_ids in pid_to_agents.items():
-                    active_count = 0
-                    check_ids = agent_ids if wants_full else agent_ids[:15]
-                    print(f"DEBUG: Checking {len(check_ids)} agent codes for product {pid}")
-                    for aid in check_ids:
-                        print(f"DEBUG: Calling status API for {aid}")
-                        status_list = bot.fetch_agent_status(aid)
-                        if not status_list:
-                            continue
-                        s = status_list[0] if isinstance(status_list, list) else status_list
-                        status = str(s.get("Status", "")).upper()
-                        print(f"DEBUG: {aid} -> {status}")
-                        if status in ("READY", "AVAILABLE", "IDLE", "ONCALL", "ON CALL", "BUSY"):
-                            active_count += 1
-                    label = f"Product {pid}" if pid is not None else "All Products"
-                    summary_lines.append(f"- {label}: {active_count} active now (sampled)")
-                text_out = "👥 Agent activity (quick check):\n" + ("\n".join(summary_lines) if summary_lines else "No agents found in recent activity.")
-                say(text_out)
-                return
-            sql = ai_response.get("sql")
-            explanation = ai_response.get("explanation", "Query executed")
-            if sql:
-                result_text, query_id, df_masked = bot.execute_sql_query(sql, explanation, user_id=user_id, allow_personal_cache=True)
-                # If the user asked for agent active summary, augment the message
-                if (entities.get("flags") or {}).get("agent_active_summary"):
-                    products = entities.get("products") or []
-                    wants_full = (entities.get("flags") or {}).get("agent_active_summary_full")
-                    if wants_full:
-                        print("DEBUG: Running FULL agent activity scan (augment)")
-                        pid_to_agents = bot.get_all_agent_ids_for_products(products)
-                    else:
-                        pid_to_agents = bot.get_recent_agent_ids_for_products(products, limit_per_product=15)
-                    summary_lines = []
-                    total_active = 0
-                    for pid, agent_ids in pid_to_agents.items():
-                        active_count = 0
-                        check_ids = agent_ids if wants_full else agent_ids[:15]
-                        print(f"DEBUG: Checking {len(check_ids)} agent codes for product {pid}")
-                        for aid in check_ids:
-                            print(f"DEBUG: Calling status API for {aid}")
-                            status_list = bot.fetch_agent_status(aid)
-                            if not status_list:
-                                continue
-                            s = status_list[0] if isinstance(status_list, list) else status_list
-                            status = str(s.get("Status", "")).upper()
-                            print(f"DEBUG: {aid} -> {status}")
-                            if status in ("READY", "AVAILABLE", "IDLE", "ONCALL", "ON CALL", "BUSY"):
-                                active_count += 1
-                        total_active += active_count
-                        label = f"Product {pid}" if pid is not None else "All Products"
-                        summary_lines.append(f"- {label}: {active_count} active now (sampled)")
-                    if summary_lines:
-                        result_text += "\n\n👥 Agent activity (quick check):\n" + "\n".join(summary_lines)
-                
-                if query_id:
-                    # Split long text into safe block-sized chunks
-                    def chunk_text(s: str, limit: int = 2500):
-                        parts = []
-                        while s:
-                            parts.append(s[:limit])
-                            s = s[limit:]
-                        return parts
-                    chunks = chunk_text(result_text)
-                    blocks = []
-                    for i, ch in enumerate(chunks):
-                        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": ch}})
-                    # Action buttons (include feedback buttons)
-                    blocks.append({
-                        "type": "actions",
-                        "elements": [
-                            {"type": "button", "text": {"type": "plain_text", "text": "✅ Correct"}, "action_id": "mark_correct", "style": "primary", "value": query_id},
-                            {"type": "button", "text": {"type": "plain_text", "text": "❌ Wrong"}, "action_id": "mark_wrong", "style": "danger", "value": query_id},
-                            {"type": "button", "text": {"type": "plain_text", "text": "📥 Download Excel"}, "action_id": "download_excel", "value": query_id},
-                            {"type": "button", "text": {"type": "plain_text", "text": "🔔 Subscribe"}, "action_id": "subscribe_alerts", "value": query_id}
-                        ]
-                    })
-                    say(blocks=blocks, text=chunks[0] if chunks else result_text)
-                else:
-                    # Fallback plain text if no query_id
-                    say(result_text[:2900])
-            else:
-                say("❌ I couldn't generate a query for that request.")
-        elif intent == "conversation":
-            say(f"💭 {ai_response.get('response', 'I am here to help!')}")
-        elif intent == "feedback":
-            try:
-                feedback_id = business_logic_manager.store_feedback(user_id, text, "User provided feedback", context={})
-                if feedback_id:
-                    send_feedback_to_channel(feedback_id, user_id, text, {})
-            except Exception:
-                pass
-            say("✅ Thank you for your feedback!")
-        elif intent == "clarification":
-            say("🤔 Noted. I can log this as a suggestion to improve product/insurer matching.")
-        else:
-            say("🤔 I'm not sure how to help. Try asking about business metrics.")
-    
+                        send_feedback_to_channel(
+                            feedback_id,
+                            user_id,
+                            text,
+                            {},
+                            context={"query_id": query_id, "sql": sql_query, "explanation": explanation, "reason": feedback_text}
+                        )
+                break # Stop after finding the first keyword
     except Exception as e:
         debug(f"Error in run_main_logic: {e}")
         say("❌ Something went wrong. Please try again.")
@@ -1061,7 +883,7 @@ def handle_agent_mode(text: str, user_id: str, say):
             desired_statuses = set([str(s).upper() for s in (agent_ai.get("status_filters") or [])]) or set(bot.parse_status_filter(text))
             for pid, agent_ids in pid_to_agents.items():
                 active_count = 0
-                check_ids = explicit_codes or (agent_ids if wants_full else agent_ids[:15])
+                check_ids = explicit_codes or agent_ids
                 debug(f"Agent summary - product={pid} checking {len(check_ids)} codes")
                 for aid in check_ids:
                     debug(f"Calling status API for {aid}")
@@ -1093,15 +915,20 @@ def handle_agent_mode(text: str, user_id: str, say):
                 label = f"Product {pid}" if pid is not None else "All Products"
                 if desired_statuses:
                     status_label = "/".join(sorted(desired_statuses))
-                    summary_lines.append(f"- {label}: {active_count} with status {status_label}" + (" (sampled)" if not wants_full and not explicit_codes else ""))
+                    summary_lines.append(f"- {label}: {active_count} with status {status_label}")
                 else:
-                    summary_lines.append(f"- {label}: {active_count} active now" + (" (sampled)" if not wants_full and not explicit_codes else ""))
+                    summary_lines.append(f"- {label}: {active_count} active now")
             header = "👥 Agent activity:\n" + ("\n".join(summary_lines) if summary_lines else "No agents found.")
             # Append details if any
             if details_lines:
                 # Limit to avoid Slack overflow
-                detail_preview = "\n".join(details_lines[:30])
-                header += "\n\n👤 Active agents (sample):\n" + detail_preview
+                total = len(details_lines)
+                preview_count = min(30, total)
+                detail_preview = "\n".join(details_lines[:preview_count])
+                if total > preview_count:
+                    header += f"\n\n👤 Active agents (showing {preview_count} of {total}):\n" + detail_preview
+                else:
+                    header += "\n\n👤 Active agents:\n" + detail_preview
             say(header)
             return
 
@@ -1168,33 +995,214 @@ def handle_agent_mode(text: str, user_id: str, say):
         print(f"Error in handle_agent_mode: {e}")
         say("❌ Something went wrong in agent mode.")
 
+# --- Web Chat Integration ---
+web_app = Flask(__name__)
+CORS(web_app)
+slack_web_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+WEB_CHAT_CHANNEL = "C098DTBQZ8E"
+web_replies_store = []  # [{id, text}]
+web_message_counter = 0
+
+# Add this function to run the Flask app
+
+def run_web_app():
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    web_app.run(host='0.0.0.0', port=port)
+
+# Store last query_id for web_user
+WEB_USER_LAST_QUERY_ID = None
+
+@web_app.route('/api/chat', methods=['POST'])
+def web_chat():
+    global WEB_USER_LAST_QUERY_ID
+    data = request.json
+    user_message = data.get('message', '')
+    action_id = data.get('action_id')
+    user_id = data.get('user_id') or 'web_user'
+    responses = []
+
+    def say(msg=None, **kwargs):
+        global WEB_USER_LAST_QUERY_ID
+        # If this is a query result, add Subscribe and Feedback buttons
+        if msg is not None and 'Query ID:' in msg:
+            # Extract query_id from the message
+            import re
+            m = re.search(r'Query ID: `?(\w+)`?', msg)
+            query_id = m.group(1) if m else None
+            if query_id:
+                WEB_USER_LAST_QUERY_ID = query_id
+                # Add buttons for download, subscribe, feedback
+                blocks = [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": msg}},
+                    {"type": "actions", "elements": [
+                        {"type": "button", "text": {"type": "plain_text", "text": "📥 Download Excel"}, "action_id": "download_excel", "value": query_id},
+                        {"type": "button", "text": {"type": "plain_text", "text": "🔔 Subscribe"}, "action_id": "subscribe_alerts", "value": query_id},
+                        {"type": "button", "text": {"type": "plain_text", "text": "📝 Feedback"}, "action_id": "feedback", "value": query_id}
+                    ]}
+                ]
+                responses.append({'type': 'blocks', 'blocks': blocks, 'text': msg})
+                return
+        if msg is not None:
+            responses.append({'type': 'text', 'text': msg})
+        elif 'blocks' in kwargs:
+            blocks = kwargs['blocks']
+            for block in blocks:
+                if block.get('type') == 'actions':
+                    for el in block.get('elements', []):
+                        if el.get('action_id') == 'download_excel' and 'value' in el:
+                            WEB_USER_LAST_QUERY_ID = el['value']
+            responses.append({'type': 'blocks', 'blocks': blocks, 'text': kwargs.get('text', '')})
+        elif 'text' in kwargs:
+            responses.append({'type': 'text', 'text': kwargs['text']})
+
+    # Handle action_id (button click)
+    if action_id:
+        if action_id == 'show_menu':
+            show_main_menu(user_id, say)
+        elif action_id == 'choose_metrics':
+            say('Please enter your metrics query (e.g., "fire insurance bookings this month").')
+        elif action_id == 'choose_agent_status':
+            USER_SESSIONS[user_id] = {"mode": "agent"}
+            say('Please enter your agent status query (e.g., "agents active now").')
+        elif action_id == 'show_help':
+            say('ℹ️ You can ask me about insurance metrics, agent status, or set up alerts. Try: "fire insurance bookings this month" or "agents active now".')
+        elif action_id == 'end_session':
+            say('🛑 Session ended. Type anything to start again.');
+        elif action_id == 'download_excel':
+            if WEB_USER_LAST_QUERY_ID:
+                download_url = f"/download_excel/{WEB_USER_LAST_QUERY_ID}"
+                responses.append({'type': 'download', 'url': download_url, 'label': 'Download Excel'})
+            else:
+                responses.append({'type': 'text', 'text': 'No query result available for download.'})
+        elif action_id == 'subscribe_alerts':
+            # Ask for frequency if not provided
+            frequency = data.get('frequency')
+            if not frequency:
+                # Show frequency options as buttons
+                freq_blocks = [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "How often do you want to receive alerts for this query?"}},
+                    {"type": "actions", "elements": [
+                        {"type": "button", "text": {"type": "plain_text", "text": "Hourly"}, "action_id": "subscribe_alerts", "value": "hourly"},
+                        {"type": "button", "text": {"type": "plain_text", "text": "Daily (9 AM)"}, "action_id": "subscribe_alerts", "value": "daily"},
+                        {"type": "button", "text": {"type": "plain_text", "text": "Weekly (Mon 9 AM)"}, "action_id": "subscribe_alerts", "value": "weekly"}
+                    ]}
+                ]
+                responses.append({'type': 'blocks', 'blocks': freq_blocks, 'text': ''})
+            else:
+                # Actually add the subscription
+                # Find the last query context for this user
+                last_query_id = WEB_USER_LAST_QUERY_ID
+                query_context = None
+                if last_query_id and os.path.exists(f"query_results/{last_query_id}.json"):
+                    with open(f"query_results/{last_query_id}.json", "r") as f:
+                        payload = json.load(f)
+                    query_context = {
+                        "sql": payload.get("sql"),
+                        "explanation": payload.get("explanation")
+                    }
+                else:
+                    query_context = {"sql": None, "explanation": None}
+                subscription_manager.add_subscription(user_id, 'web_chat', query_context, frequency)
+                responses.append({'type': 'text', 'text': f'🔔 You are now subscribed to {frequency} alerts for this query!'})
+        elif action_id == 'feedback':
+            responses.append({'type': 'feedback_form', 'query_id': WEB_USER_LAST_QUERY_ID})
+        elif action_id == 'submit_feedback':
+            feedback = data.get('feedback', '')
+            query_id = data.get('query_id', '')
+            business_logic_manager.store_feedback(
+                user_id=user_id,
+                original_query=f"Query ID: {query_id}",
+                feedback_text=feedback,
+                context={"query_id": query_id, "feedback": feedback}
+            )
+            responses.append({'type': 'text', 'text': '✅ Thank you for your feedback!'})
+        else:
+            say(f'Action: {action_id}')
+    else:
+        # If user_message is empty, only show main menu
+        if not user_message or user_message.strip() == '':
+            show_main_menu(user_id, say)
+        elif user_message.strip().lower() in ("menu", "main menu", "start over", "restart"):
+            show_main_menu(user_id, say)
+        else:
+            intent = classify_intent(user_message)
+            if intent == 'agent_status' or USER_SESSIONS.get(user_id, {}).get("mode") == "agent":
+                handle_agent_mode(user_message, user_id, say)
+            else:
+                run_main_logic(user_message, user_id, say)
+
+    if responses:
+        return jsonify({'responses': responses})
+    else:
+        return jsonify({'responses': [{'type': 'text', 'text': "Sorry, I didn't understand that."}]})
+
+@web_app.route('/api/replies', methods=['GET'])
+def web_get_replies():
+    since = int(request.args.get('since', 0))
+    # Return all replies with id > since
+    new_replies = [msg for msg in web_replies_store if msg['id'] > since]
+    return jsonify(new_replies)
+
+@web_app.route('/download_excel/<query_id>')
+def download_excel(query_id):
+    # Serve the Excel file for download
+    export_path = f"temp_exports/{query_id}.xlsx"
+    if not os.path.exists(export_path):
+        # Try to generate the file from the cached query result
+        try:
+            with open(f"query_results/{query_id}.json", "r") as f:
+                payload = json.load(f)
+            df = pd.DataFrame(payload.get("data_unmasked") or payload.get("data", []))
+            os.makedirs("temp_exports", exist_ok=True)
+            df.to_excel(export_path, index=False)
+        except Exception as e:
+            return f"Failed to generate Excel file: {e}", 404
+    return send_file(export_path, as_attachment=True)
+
+# --- Listen for bot replies in the channel ---
+from slack_bolt.context.say import Say
+
+def store_web_reply(text):
+    global web_message_counter
+    web_message_counter += 1
+    web_replies_store.append({'id': web_message_counter, 'text': text})
+
+# Remove old_handle_message logic (not needed)
+
 @app.event("app_mention")
-def handle_message(event, say):
+def handle_message(event, say: Say):
     user_id = event["user"]
     text = re.sub(r'^<@\w+>\s*', '', event.get("text", "")).strip()
     print(f"\n\nDEBUG: ----- NEW MESSAGE RECEIVED -----\nUser: {user_id}\nText: '{text}'\n------------------------------------")
-    
     if not text:
         show_main_menu(user_id, say)
         return
-    
-    # If text equals 'menu', show menu; otherwise process
     if text.strip().lower() in ("menu", "main menu", "start over", "restart"):
         show_main_menu(user_id, say)
         return
-
-    # If no mode chosen yet, route smartly or show menu
     mode = (USER_SESSIONS.get(user_id) or {}).get("mode")
     if not mode:
         tl = text.lower()
-        if any(k in tl for k in ["agents active", "active agents", "agents online", "how many agents"]):
+        if any(k in tl for k in ["agent", "agents"]):
+            USER_SESSIONS[user_id] = {"mode": "agent"}
             return handle_agent_mode(text, user_id, say)
         show_main_menu(user_id, say)
         return
-
+    if mode == 'agent':
+        debug(f"Routing to agent mode for user {user_id}")
+        return handle_agent_mode(text, user_id, say)
     debug(f"Routing to run_main_logic for user {user_id} (mode={mode})")
     say("🤖 Processing...")
-    run_main_logic(text, user_id, say)
+    # Capture the say function to also store web replies
+    def say_and_store(msg=None, **kwargs):
+        if msg:
+            say(msg, **kwargs)
+            store_web_reply(msg)
+        elif 'text' in kwargs:
+            say(kwargs['text'], **kwargs)
+            store_web_reply(kwargs['text'])
+    run_main_logic(text, user_id, say_and_store)
 
 # All other handlers (subscribe, feedback, etc.) remain the same
 
@@ -1476,14 +1484,18 @@ def handle_reject_feedback(ack, body, say):
 def handle_choose_metrics(ack, body, say):
     ack()
     user_id = body.get("user", {}).get("id") or body.get("user", {}).get("user_id")
-    USER_SESSIONS[user_id] = {"mode": "metrics"}
+    if not USER_SESSIONS.get(user_id):
+        USER_SESSIONS[user_id] = {}
+    USER_SESSIONS[user_id]["mode"] = "metrics"
     say("✅ Metrics mode selected. Ask your question (e.g., 'marine bookings yesterday'). Type 'menu' anytime to switch.")
 
 @app.action("choose_agent_status")
 def handle_choose_agent_status(ack, body, say):
     ack()
     user_id = body.get("user", {}).get("id") or body.get("user", {}).get("user_id")
-    USER_SESSIONS[user_id] = {"mode": "agent"}
+    if not USER_SESSIONS.get(user_id):
+        USER_SESSIONS[user_id] = {}
+    USER_SESSIONS[user_id]["mode"] = "agent"
     say("✅ Agent mode selected. Ask 'agent status for <name>' or 'agents active now'. Type 'menu' anytime to switch.")
 
 if __name__ == "__main__":
@@ -1496,5 +1508,7 @@ if __name__ == "__main__":
             distinct_cache.prewarm_async()
     except Exception:
         pass
+    flask_thread = threading.Thread(target=run_web_app, daemon=True)
+    flask_thread.start()
     handler = SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN"))
     handler.start()

@@ -1,1 +1,0 @@
-{"data": [{"product_name": "Marine Insurance", "_col1": 352194}], "sql": "SELECT CASE WHEN investmenttypeid = 13 THEN 'Marine Insurance' END as product_name, COUNT(*) FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (13) GROUP BY CASE WHEN investmenttypeid = 13 THEN 'Marine Insurance' END", "explanation": "This query counts leads for Marine Insurance."}

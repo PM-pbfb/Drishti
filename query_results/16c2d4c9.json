@@ -1,1 +1,1 @@
-{"data": [{"leads": 205}], "sql": "SELECT COUNT(*) as leads FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (5) AND DATE(leaddate) = CURRENT_DATE - INTERVAL '1' DAY", "explanation": "Metric: leads; Products: [5]; Time: yesterday"}
+{"data_unmasked": [{"leads": 242}], "data": [{"leads": 242}], "sql": "SELECT COUNT(*) as leads FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (5) AND DATE(leaddate) = CURRENT_DATE - INTERVAL '1' DAY", "explanation": "Metric: leads; Products: [5]; Time: yesterday"}

@@ -1,1 +1,0 @@
-{"data": [{"_col0": 34}], "sql": "SELECT COUNT(*) FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (5, 112, 113) AND DATE(bookingdate) = CURRENT_DATE - INTERVAL '1' DAY", "explanation": "This query counts the number of fire insurance policies booked yesterday."}

@@ -1,1 +1,0 @@
-{"data": [{"leads": 359}], "sql": "SELECT COUNT(*) as leads FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (16) AND leaddate >= DATE_TRUNC('month', CURRENT_DATE)", "explanation": "Metric: leads; Products: [16]; Time: this month"}

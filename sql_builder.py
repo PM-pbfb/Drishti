@@ -5,6 +5,7 @@ Takes extracted entities and produces safe Presto SQL
 """
 
 from typing import Dict, Any, List, Tuple
+import re
 
 from config import TABLE_SCHEMA, TIME_PATTERNS, SQL_PATTERNS, PRODUCTS
 from distinct_cache import distinct_cache
@@ -90,14 +91,82 @@ def build_sql(entities: Dict[str, Any]) -> Dict[str, str]:
     fuzzy_value = None
     if isinstance(filters, dict) and "_fuzzy_value" in filters:
         fuzzy_value = filters.pop("_fuzzy_value")
+
     for col, values in filters.items():
         if not _validate_filter_column(col):
+            # Allow column if it's explicitly in the table schema, even if not "categorical"
+            if col not in TABLE_SCHEMA:
+                continue
+
+        # Handle "not null" case
+        if isinstance(values, str) and values.lower().strip() == 'not null':
+            where_clauses.append(f"{col} IS NOT NULL")
             continue
-        safe_values = [v.replace("'", "''") for v in values if isinstance(v, str)]
+        
+        # Handle "is null" case
+        if isinstance(values, str) and values.lower().strip() == 'null':
+            where_clauses.append(f"{col} IS NULL")
+            continue
+
+        # Ensure values are in a list for consistent processing
+        if not isinstance(values, list):
+            values = [values]
+
+        safe_values = [str(v).replace("'", "''") for v in values if v is not None]
         if not safe_values:
             continue
-        in_list = ", ".join(f"'{v}'" for v in safe_values)
-        where_clauses.append(f"{col} IN ({in_list})")
+        
+        # Handle mixed "not null" and other values, e.g., "is not null or 0"
+        is_not_null_present = any(str(v).lower().strip() == 'not null' for v in values)
+        is_null_present = any(str(v).lower().strip() == 'null' for v in values)
+
+        # Filter out the 'not null'/'null' strings to process other values
+        other_values = [v for v in safe_values if str(v).lower().strip() not in ('not null', 'null')]
+
+        sub_clauses = []
+        if other_values:
+            # Differentiate between numbers and strings for quoting
+            numeric_vals, string_vals = [], []
+            not_numeric_vals, not_string_vals = [], []
+
+            for v in other_values:
+                val_str = str(v).strip()
+                is_negative = val_str.lower().startswith(('not ', '!=', '<>'))
+                
+                val_part = re.sub(r"^(not\s*|!=\s*|<>\s*)", "", val_str, flags=re.IGNORECASE).strip()
+
+                if re.fullmatch(r"-?\d+(\.\d+)?", val_part):
+                    if is_negative:
+                        not_numeric_vals.append(val_part)
+                    else:
+                        numeric_vals.append(val_part)
+                else:
+                    # It's a string, add quotes
+                    if is_negative:
+                        not_string_vals.append(f"'{val_part}'")
+                    else:
+                        string_vals.append(f"'{val_part}'")
+            
+            # Positive conditions
+            if numeric_vals:
+                sub_clauses.append(f"{col} IN ({', '.join(numeric_vals)})")
+            if string_vals:
+                sub_clauses.append(f"{col} IN ({', '.join(string_vals)})")
+            
+            # Negative conditions
+            if not_numeric_vals:
+                sub_clauses.append(f"{col} NOT IN ({', '.join(not_numeric_vals)})")
+            if not_string_vals:
+                sub_clauses.append(f"{col} NOT IN ({', '.join(not_string_vals)})")
+
+        if is_not_null_present:
+            sub_clauses.append(f"{col} IS NOT NULL")
+        
+        if is_null_present:
+            sub_clauses.append(f"{col} IS NULL")
+
+        if sub_clauses:
+            where_clauses.append(f"({ ' OR '.join(sub_clauses) })")
 
     # Fallback fuzzy search: if a fuzzy_value is provided and no prior categorical filter used it
     if fuzzy_value and not any(k for k in filters.keys()):

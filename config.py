@@ -2488,8 +2488,9 @@ TIME_PATTERNS = {
 }
 # HELPER FUNCTIONS FOR INTELLIGENT COLUMN SELECTION
 def get_high_priority_columns():
-    """Get columns marked as high priority for AI context"""
-    return {col: meta for col, meta in TABLE_SCHEMA.items()
+    """Returns a simplified dict of high-priority columns for prompts."""
+    return {col: {"data_type": meta.get("data_type", "unknown"), "description": meta.get("description", "")}
+            for col, meta in TABLE_SCHEMA.items()
             if meta.get("pii_level") != 'high'} # Simplified logic for now
 
 def get_categorical_columns():
@@ -2517,3 +2518,11 @@ def get_product_context(product_id):
 
 # BACKWARD COMPATIBILITY - Keep old names for existing code
 ESSENTIAL_COLUMNS = get_high_priority_columns()
+
+def get_db_schema_details() -> str:
+    """Formats the table schema into a string for AI prompts."""
+    details = []
+    for col, meta in TABLE_SCHEMA.items():
+        desc = meta.get('description', '')
+        details.append(f"- {col} ({meta.get('data_type', 'unknown')}): {desc}")
+    return "\n".join(details)

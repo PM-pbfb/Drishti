@@ -1,1 +1,0 @@
-{"data": [{"_col0": 352643}], "sql": "SELECT COUNT(*) FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (10, 13, 47)", "explanation": "This query counts the number of bookings for Key Man Insurance, Marine Insurance, and Money Insurance."}

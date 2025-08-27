@@ -1,1 +1,0 @@
-{"data": [{"bookings": 5}], "sql": "SELECT COUNT(CASE WHEN booking_status='IssuedBusiness' THEN 1 END) as bookings FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid IN (5) AND DATE(leaddate) = CURRENT_DATE - INTERVAL '1' DAY", "explanation": "Metric: bookings; Products: [5]; Time: yesterday"}

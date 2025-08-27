@@ -204,3 +204,32 @@ Analyze the feedback and respond with the JSON object above."""
 
 # Global instance
 intent_classifier = IntentClassifier() 
+
+from typing import Dict, Any
+
+def classify_intent(user_query: str) -> str:
+    """
+    Classifies the user's intent as either 'simple_metric' or 'business_logic'.
+    
+    This is a basic keyword-based classifier. A more advanced implementation
+    could use a machine learning model.
+    """
+    logic_keywords = [
+        'who', 'what', 'when', 'where', 'why', 'how',
+        'compare', 'trend', 'define', 'consider', 'logic',
+        'calculate', 'based on', 'if', 'and', 'or', 'but',
+        'is not null', 'is null', 'not in', '>', '<', '=', '!='
+    ]
+    
+    query_lower = user_query.lower()
+    
+    # If the query is very short, it's likely a simple greeting or command
+    if len(query_lower.split()) <= 2:
+        return 'simple_metric' # Fallback to default handler
+
+    for keyword in logic_keywords:
+        if keyword in query_lower:
+            return 'business_logic'
+            
+    # If no complex keywords are found, assume it's a simple metric query
+    return 'simple_metric' 

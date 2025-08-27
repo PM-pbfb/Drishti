@@ -1,0 +1,28 @@
+[
+    {
+        "id": 1756117375,
+        "user_id": "U08GXTRTKJA",
+        "original_query": "workmen compensation leads for yesterday where referallid was not null and not 0.  for future understand if anyone says if winback is created or not referral id will not be null and will not be 0",
+        "feedback_text": "if anyone says if winback is created or not referral id will not be null and will not be 0",
+        "context": {
+            "query_id": "fb0eeded",
+            "sql": "SELECT COUNT(*) FROM sme_analytics.sme_leadbookingrevenue WHERE DATE(leaddate) = CURRENT_DATE - INTERVAL '1' DAY AND investmenttypeid = 1 AND referralid IS NOT NULL AND referralid != 0",
+            "explanation": "This query counts the number of workmen compensation leads (assuming investmenttypeid = 1 represents workmen compensation) from yesterday where referralid was not null and not 0."
+        },
+        "status": "pending",
+        "timestamp": "2025-08-25T15:52:55.521086"
+    },
+    {
+        "id": 1756117773,
+        "user_id": "U08GXTRTKJA",
+        "original_query": "workmen compensation leads for yesterday where referallid was not null and not 0.  for future understand if anyone says if winback is created or not referral id will not be null and will not be 0",
+        "feedback_text": "if anyone says if winback is created or not referral id will not be null and will not be 0",
+        "context": {
+            "query_id": "b6838d72",
+            "sql": "SELECT COUNT(*) FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid = 19 AND DATE(leaddate) = CURRENT_DATE - INTERVAL '1' DAY AND referralid IS NOT NULL AND referralid != 0",
+            "explanation": "This query counts the number of workmen compensation leads (investmenttypeid = 19) from yesterday where the referralid was not null and not 0."
+        },
+        "status": "approved",
+        "timestamp": "2025-08-25T15:59:33.556301"
+    }
+]

@@ -84,13 +84,13 @@ Rules:
 - If no product is named, return an empty products list.
 - Infer the metric only if clearly stated (supported metrics: {metric_options}).
 - Normalize time into a key like: today, yesterday, this week, last week, this month, last month.
-- Extract dimensions only if explicitly asked for breakdowns (e.g., agent wise → leadassignedagentname; product wise → investmenttypeid).
-- Extract filters like marketing categories (CRM, SEO) or platforms ONLY if clearly stated.
+- CRITICAL: If the user provides a direct column condition (e.g., "where referral id is not null", "referralid is 0", "status is not 'Closed'"), extract it LITERALLY. PRESERVE negative words like "not", "isn't", "!=". Example: "referral id is not 0" should be {{"referralid": ["not 0"]}}.
 - If user indicates online bookings, set flags.online_only = true.
 - If anything is ambiguous, include a short note in ambiguities.
 - If the user asks for multiple metrics, put them in metrics []. If only one, set metric.
 - If the user asks for top/bottom or most/least, include order.by (metric or dimension), order.direction, and order.top_n.
 - Normalize 'product wise' to dimension "investmenttypeid".
+- **FINAL CHECK**: It is better to return fewer extracted fields than to return incorrect or hallucinated fields. If you are not confident, leave the field empty.
 
 Special handling:
 - If the user asks about agent status (e.g., "what is my agent doing", "agent status", "is <agent name> free/on call"), set intent to agent_status.
