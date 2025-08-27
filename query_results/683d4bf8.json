@@ -1,1 +1,0 @@
-{"data_unmasked": [{"_col0": 0}], "data": [{"_col0": 0}], "sql": "SELECT COUNT(*) FROM sme_analytics.sme_leadbookingrevenue WHERE DATE(leaddate) = CURRENT_DATE - INTERVAL '1' DAY AND lead_lob = 'wc'", "explanation": "This query counts the number of winback leads created yesterday (based on leaddate) that belong to the 'wc' line of business (lead_lob)."}
