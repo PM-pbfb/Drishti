@@ -318,10 +318,13 @@
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
 
+        // Set your ngrok public URL here (replace with your actual ngrok URL)
+        const API_BASE = "https://YOUR_NGROK_SUBDOMAIN.ngrok.io";
+
         async function sendToBot(text, action_id=null, extra={}) {
             sendBtn.disabled = true;
             const payload = action_id ? { action_id, user_id: webUserId, ...extra } : { message: text, user_id: webUserId };
-            const res = await fetch('http://localhost:5000/api/chat', {
+            const res = await fetch(API_BASE + '/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)

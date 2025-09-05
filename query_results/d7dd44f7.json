@@ -1,0 +1,1 @@
+{"data_unmasked": [{"total_leads": 11994}], "data": [{"total_leads": 11994}], "sql": "SELECT COUNT(*) AS total_leads FROM sme_analytics.sme_leadbookingrevenue WHERE investmenttypeid = 5 AND leaddate >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1' MONTH", "explanation": "This query calculates the total number of fire insurance leads (investmenttypeid = 5) for the last month."}
